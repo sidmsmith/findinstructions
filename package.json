@@ -1,0 +1,19 @@
+{
+  "name": "findinstructions",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vercel dev",
+    "start": "node server.js"
+  },
+  "description": "Find MAWM assigned Pick/Pack instructions for an Order or oLPN",
+  "main": "server.js",
+  "dependencies": {
+    "express": "^5.1.0",
+    "node-fetch": "^2.6.7"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}

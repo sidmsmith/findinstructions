@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Find Instructions v1.0.0</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    :root {
+      --bg-color: #ffffff;
+      --text-color: #1f2933;
+      --text-muted: #616e7c;
+      --card-bg: #f8fafc;
+      --border-color: #d9e2ec;
+      --input-bg: #ffffff;
+      --input-border: #cbd5e0;
+      --input-focus-bg: #ffffff;
+      --input-focus-border: #5a67d8;
+      --input-focus-shadow: rgba(90,103,216,0.25);
+      --primary-color: #5a67d8;
+      --primary-hover: #4c51bf;
+      --success-color: #28a745;
+      --danger-color: #dc3545;
+      --table-head-bg: #eef1f8;
+    }
+    body {
+      background: var(--bg-color);
+      color: var(--text-color);
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      padding: 1rem;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+    }
+    h2 { text-align: center; color: var(--primary-color); margin-bottom: 1.5rem; }
+    .form-control, .form-select {
+      background: var(--input-bg);
+      border: 1px solid var(--input-border);
+      color: var(--text-color);
+      border-radius: 8px;
+    }
+    .form-control:focus, .form-select:focus {
+      background: var(--input-focus-bg);
+      border-color: var(--input-focus-border);
+      box-shadow: 0 0 0 0.2rem var(--input-focus-shadow);
+      color: var(--text-color);
+    }
+    .btn-primary { background: var(--primary-color); border-color: var(--primary-color); }
+    .btn-primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
+    .status {
+      min-height: 1.5em;
+      font-weight: 500;
+      padding: 0.5rem 0.75rem;
+      border-radius: 8px;
+      margin-bottom: 1rem;
+    }
+    .status.info { background: #e3f2fd; color: #1976d2; }
+    .status.success { background: #e8f5e9; color: #2e7d32; }
+    .status.error { background: #ffebee; color: #c62828; }
+    .status.warn { background: #fff8e1; color: #8a6d00; }
+    #mainUI { display: none; }
+    .mode-toggle .btn-check:checked + .btn-outline-primary {
+      background: var(--primary-color);
+      border-color: var(--primary-color);
+      color: #fff;
+    }
+    table.instructions-table { background: #fff; }
+    table.instructions-table thead th {
+      background: var(--table-head-bg);
+      position: sticky;
+      top: 0;
+      font-size: 0.85rem;
+    }
+    table.instructions-table td, table.instructions-table th {
+      font-size: 0.85rem;
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+    .table-responsive { max-height: 60vh; }
+    .diagnostics summary { cursor: pointer; font-weight: 600; color: var(--text-muted); }
+    .diagnostics pre {
+      background: #0f172a;
+      color: #d1d5db;
+      padding: 0.75rem;
+      border-radius: 8px;
+      max-height: 400px;
+      overflow: auto;
+      font-size: 0.75rem;
+    }
+    .counts-row .badge { font-size: 0.8rem; margin-right: 0.5rem; }
+  </style>
+</head>
+<body class="p-4">
+  <div class="container" style="max-width: 1100px;">
+    <div class="card">
+      <h2>Find Instructions</h2>
+
+      <div id="authSection">
+        <div class="mb-3">
+          <label class="form-label">ORG:</label>
+          <input type="text" id="org" class="form-control" placeholder="Enter ORG (e.g. SS-DEMO)" />
+          <small class="text-muted">Press Enter to authenticate</small>
+          <div id="authStatus" class="status info" style="display: none; margin-top: 0.5rem;"></div>
+        </div>
+      </div>
+
+      <div id="mainUI">
+        <div class="mb-3">
+          <div class="btn-group mode-toggle" role="group">
+            <input type="radio" class="btn-check" name="mode" id="modeOrder" value="order" autocomplete="off" checked>
+            <label class="btn btn-outline-primary" for="modeOrder">Order ID</label>
+            <input type="radio" class="btn-check" name="mode" id="modeOlpn" value="olpn" autocomplete="off">
+            <label class="btn btn-outline-primary" for="modeOlpn">oLPN ID</label>
+          </div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label" id="valueLabel">Order ID:</label>
+          <div class="d-flex gap-2">
+            <input type="text" id="valueInput" class="form-control" placeholder="Enter an Order ID" />
+            <button id="searchBtn" class="btn btn-primary" type="button"><i class="fas fa-search"></i> Search</button>
+          </div>
+        </div>
+
+        <div id="status" class="status info" style="display: none;"></div>
+
+        <div id="results" style="display: none;">
+          <div class="counts-row mb-2"></div>
+          <div class="table-responsive">
+            <table class="table table-sm table-bordered instructions-table">
+              <thead>
+                <tr>
+                  <th>Seq</th>
+                  <th>Type</th>
+                  <th>Instruction</th>
+                  <th>Order</th>
+                  <th>Order Line</th>
+                  <th>Item</th>
+                  <th>oLPN</th>
+                  <th>oLPN Status</th>
+                  <th>oLPN Detail</th>
+                  <th>Task</th>
+                  <th>Task Detail</th>
+                  <th>Task Status</th>
+                  <th>Requestor Type</th>
+                  <th>Requestor ID</th>
+                  <th>Process</th>
+                </tr>
+              </thead>
+              <tbody id="resultsBody"></tbody>
+            </table>
+          </div>
+
+          <div id="unmatchedSection" style="display:none;" class="mt-3">
+            <h6>Unmatched / no instruction found</h6>
+            <ul id="unmatchedList" class="small text-muted"></ul>
+          </div>
+
+          <details class="diagnostics mt-3">
+            <summary>Raw API responses / diagnostics</summary>
+            <pre id="rawOutput"></pre>
+          </details>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
