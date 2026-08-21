@@ -13,9 +13,10 @@
 //     proposed /pickpack/api/task/taskDetail/search instead.
 //   - /pickpack/api/fw-aux-svcs/assignedInstruction/search and the
 //     OlpnAndDetailsServiceRequestorIds / OlpnDetail.AssignedInstruction join:
-//     NOT independently verified against this ecosystem's own code — taken
-//     from the supplied Glean report only. Treat as unverified until a live
-//     call confirms the shape.
+//     taken from the supplied Glean report — CONFIRMED live against SS-DEMO
+//     order 6000012 (2026-08-17): returned real Repack/Apply Labels Pick
+//     instructions correctly joined back to order line, item, oLPN, oLPN
+//     detail, and task detail.
 
 const fetch = require('node-fetch');
 const fs = require('fs');
@@ -214,8 +215,8 @@ async function findInstructions({ org, mode, value }, token) {
   if (mode === 'olpn') olpnIds.add(value);
 
   // 3. For each oLPN, pull header- and detail-level AssignedInstruction
-  //    requestor IDs (per the supplied Glean report; unverified against
-  //    this ecosystem's own code — see file header).
+  //    requestor IDs (per the supplied Glean report — see file header for
+  //    the live confirmation).
   const requestorMap = new Map(); // requestorId -> { type, olpnId, olpnDetailId, itemId }
   const olpnDetailsSeen = []; // every (olpnId, olpnDetailId, itemId) actually returned by MAWM
   const olpnsNotFound = [];
