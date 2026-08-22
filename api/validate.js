@@ -29,6 +29,32 @@ const CLIENT_SECRET = process.env.MANHATTAN_SECRET;
 const PASSWORD = process.env.MANHATTAN_PASSWORD;
 const USERNAME_BASE = process.env.MANHATTAN_USERNAME_BASE || 'sdtadmin@';
 
+// Usage tracking (Neon via the usage dashboard's ingest endpoint) — same
+// forward-and-forget pattern as Work/receivingworkbench and
+// Work/taskcompletion: never blocks or fails the caller's request.
+const USAGE_INGEST_URL = (process.env.MANHATTAN_USAGE_INGEST_URL || '').trim();
+const USAGE_INGEST_SECRET = (process.env.MANHATTAN_USAGE_INGEST_SECRET || '').trim();
+const APP_NAME = 'findinstructions-app';
+const APP_VERSION = '1.1.0';
+
+async function forwardUsageEvent(payload) {
+  if (!USAGE_INGEST_URL) {
+    console.warn('[usage] MANHATTAN_USAGE_INGEST_URL not set; event not recorded');
+    return;
+  }
+  const headers = { 'Content-Type': 'application/json' };
+  if (USAGE_INGEST_SECRET) headers.Authorization = `Bearer ${USAGE_INGEST_SECRET}`;
+  try {
+    await fetch(USAGE_INGEST_URL, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ app_name: APP_NAME, app_version: APP_VERSION, ...payload })
+    });
+  } catch (e) {
+    console.warn('[usage] Forward failed:', e.message);
+  }
+}
+
 const TASK_SEARCH_PATH = '/task/api/task/task/search';
 const OLPN_SEARCH_PATH = '/pickpack/api/pickpack/olpn/search';
 const ASSIGNED_INSTRUCTION_SEARCH_PATH = '/pickpack/api/fw-aux-svcs/assignedInstruction/search';
@@ -440,6 +466,11 @@ async function handler(req, res) {
 
   const { action, org: orgFromBody } = req.body;
 
+  if (action === 'app_opened') {
+    await forwardUsageEvent({ event_name: 'app_opened' });
+    return res.json({ success: true });
+  }
+
   // Silent-auth check: if a usable token is sitting in .token (see
   // TOKEN_FILE_PATH above), hand it straight back so the frontend can skip
   // the ORG/password prompt entirely. No MAWM round trip here — the exp
@@ -466,8 +497,12 @@ async function handler(req, res) {
       return res.json({ success: false, error: 'Server not configured: MANHATTAN_PASSWORD / MANHATTAN_SECRET missing' });
     }
     const token = await getToken(orgFromBody);
-    if (!token) return res.json({ success: false, error: 'Auth failed' });
+    if (!token) {
+      await forwardUsageEvent({ event_name: 'auth_failed', org: String(orgFromBody).toUpperCase() });
+      return res.json({ success: false, error: 'Auth failed' });
+    }
     writeTokenFile(token);
+    await forwardUsageEvent({ event_name: 'auth_success', org: String(orgFromBody).toUpperCase() });
     return res.json({ success: true, token });
   }
 
@@ -489,9 +524,16 @@ async function handler(req, res) {
 
     try {
       const result = await findInstructions({ org, mode, value: String(value).trim() }, token);
+      await forwardUsageEvent({
+        event_name: 'search_completed',
+        org: String(org).toUpperCase(),
+        mode,
+        instructionsFound: result.counts ? result.counts.instructions : undefined
+      });
       return res.json(result);
     } catch (e) {
       console.error('[search] error:', e);
+      await forwardUsageEvent({ event_name: 'search_failed', org: String(org).toUpperCase(), mode, error: e.message });
       return res.json({ success: false, error: e.message || 'Search failed', tokenInvalid: !!e.tokenInvalid });
     }
   }

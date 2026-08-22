@@ -81,6 +81,14 @@ never resolved) are surfaced in the UI rather than silently dropped.
   instructions correctly joined back to order line, item, oLPN, oLPN
   detail, and task detail.
 
+## Usage tracking
+
+If `MANHATTAN_USAGE_INGEST_URL` is set, the app forwards `app_opened`,
+`auth_success`/`auth_failed`, and `search_completed`/`search_failed`
+events to the Manhattan App Usage Dashboard's Neon ingest endpoint
+(`app_name: "findinstructions-app"`). Forwarding is best-effort — a
+failed or unconfigured ingest never blocks the request it's attached to.
+
 ## Notes / known limitations
 
 - Facility is derived as `{ORG}-DM1`, the ecosystem-wide convention (not a

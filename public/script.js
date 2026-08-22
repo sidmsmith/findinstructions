@@ -77,6 +77,8 @@ function enterMainUI() {
 // On load: check for a usable .token file before ever showing the ORG
 // prompt. If it exists and hasn't expired, auth passes silently.
 async function init() {
+  apiCall('app_opened').catch(() => {});
+
   const urlOrg = parseUrlParams();
 
   const status = await apiCall('token_status');

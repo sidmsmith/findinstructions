@@ -5,11 +5,12 @@ The notes below cover only what's specific to this repository.
 
 ## Version identifiers
 
-This project's version appears in two places — bump whichever actually
-changed:
+This project's version appears in three places — bump whichever
+actually changed:
 
 - `public/index.html` — the `<title>` ("Find Instructions vX.Y.Z")
 - `package.json` — the `version` field
+- `api/validate.js` — the `APP_VERSION` constant
 
 ## Local development and auth
 

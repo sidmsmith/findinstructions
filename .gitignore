@@ -1,5 +1,7 @@
 node_modules/
 .env
+.env.local
 .token
 .vercel
 *.log
+.DS_Store
