@@ -221,12 +221,95 @@ function renderInstructionCell(cell, text) {
   cell.innerHTML =
     `<span class="instruction-text">${text == null || text === '' ? '&mdash;' : escapeHtml(text)}</span>` +
     (canEdit
-      ? ` <button type="button" class="btn btn-link btn-sm p-0 ms-1 edit-instruction-btn" title="Edit instruction text"><i class="fas fa-pencil-alt"></i></button>`
+      ? ` <button type="button" class="btn btn-link btn-sm p-0 ms-1 edit-instruction-btn" title="Edit instruction text"><i class="fas fa-pencil-alt"></i></button>` +
+        `<button type="button" class="btn btn-link btn-sm p-0 ms-2 delete-instruction-btn" title="Delete instruction"><i class="fas fa-trash-alt"></i></button>`
       : '');
   if (canEdit) {
     cell.querySelector('.edit-instruction-btn').addEventListener('click', () => openInstructionEditor(cell));
+    cell.querySelector('.delete-instruction-btn').addEventListener('click', () => openDeleteModal(cell));
   }
 }
+
+function handleTokenInvalid() {
+  token = null;
+  mainUI.style.display = 'none';
+  authSection.style.display = 'block';
+  showAuthStatus('Saved token expired or was rejected — please re-authenticate.', 'error');
+}
+
+// Delete confirmation modal (plain DOM, no Bootstrap JS — and never a native
+// confirm(), which blocks the page).
+const deleteModal = document.getElementById('deleteModal');
+const deleteModalText = document.getElementById('deleteModalText');
+const deleteModalError = document.getElementById('deleteModalError');
+const deleteConfirmBtn = document.getElementById('deleteConfirmBtn');
+const deleteCancelBtn = document.getElementById('deleteCancelBtn');
+let pendingDeleteCell = null;
+
+function openDeleteModal(cell) {
+  pendingDeleteCell = cell;
+  deleteModalText.textContent = cell.dataset.text || '(no text)';
+  deleteModalError.style.display = 'none';
+  deleteConfirmBtn.disabled = deleteCancelBtn.disabled = false;
+  deleteConfirmBtn.innerHTML = '<i class="fas fa-trash-alt"></i> Delete';
+  deleteModal.style.display = 'flex';
+  deleteCancelBtn.focus();
+}
+
+function closeDeleteModal() {
+  if (deleteConfirmBtn.disabled && pendingDeleteCell) return; // delete in flight
+  deleteModal.style.display = 'none';
+  pendingDeleteCell = null;
+}
+
+async function confirmDelete() {
+  const cell = pendingDeleteCell;
+  if (!cell) return;
+  deleteConfirmBtn.disabled = deleteCancelBtn.disabled = true;
+  deleteConfirmBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Deleting...';
+  try {
+    const res = await apiCall('delete_instruction', { org: currentOrg, pk: cell.dataset.pk });
+    if (!res.success) {
+      if (res.tokenInvalid) {
+        pendingDeleteCell = null;
+        deleteModal.style.display = 'none';
+        handleTokenInvalid();
+        return;
+      }
+      deleteModalError.textContent = res.error || 'Delete failed';
+      deleteModalError.style.display = 'block';
+      deleteConfirmBtn.disabled = deleteCancelBtn.disabled = false;
+      deleteConfirmBtn.innerHTML = '<i class="fas fa-trash-alt"></i> Delete';
+      return;
+    }
+    // Remove every row carrying this PK and keep the count badge honest.
+    document.querySelectorAll('td.instruction-cell').forEach((c) => {
+      if (c.dataset.pk === cell.dataset.pk) c.closest('tr').remove();
+    });
+    const remaining = resultsBody.querySelectorAll('td.instruction-cell').length;
+    const countBadge = countsRow.querySelector('.bg-primary');
+    if (countBadge) countBadge.textContent = `Instructions found: ${remaining}`;
+    if (remaining === 0) {
+      resultsBody.innerHTML = `<tr><td colspan="15" class="text-muted text-center py-3">No instructions found.</td></tr>`;
+    }
+    pendingDeleteCell = null;
+    deleteModal.style.display = 'none';
+    showStatus(`Instruction deleted: "${res.deletedText}"`, 'success');
+  } catch (error) {
+    console.error('Delete error:', error);
+    deleteModalError.textContent = error.message || 'Delete failed';
+    deleteModalError.style.display = 'block';
+    deleteConfirmBtn.disabled = deleteCancelBtn.disabled = false;
+    deleteConfirmBtn.innerHTML = '<i class="fas fa-trash-alt"></i> Delete';
+  }
+}
+
+deleteConfirmBtn.addEventListener('click', confirmDelete);
+deleteCancelBtn.addEventListener('click', closeDeleteModal);
+deleteModal.addEventListener('click', (e) => { if (e.target === deleteModal) closeDeleteModal(); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && deleteModal.style.display === 'flex') closeDeleteModal();
+});
 
 function openInstructionEditor(cell) {
   const original = cell.dataset.text;
@@ -260,10 +343,7 @@ function openInstructionEditor(cell) {
       const res = await apiCall('update_instruction', { org: currentOrg, pk: cell.dataset.pk, instructionText: newText });
       if (!res.success) {
         if (res.tokenInvalid) {
-          token = null;
-          mainUI.style.display = 'none';
-          authSection.style.display = 'block';
-          showAuthStatus('Saved token expired or was rejected — please re-authenticate.', 'error');
+          handleTokenInvalid();
           return;
         }
         showStatus(res.error || 'Update failed', 'error');

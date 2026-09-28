@@ -2,7 +2,10 @@
 
 Enter a MAWM Order ID or oLPN ID and see every runtime `assignedInstruction`
 record linked to it (Pick and Pack), joined back to the Order Line, Task,
-oLPN, and oLPN Detail that produced it.
+oLPN, and oLPN Detail that produced it. Each instruction can also be
+**edited** (pencil icon — instruction text only) or **deleted** (trash icon,
+behind a confirmation) directly from the results table — see
+[Updating and deleting instructions](#updating-and-deleting-instructions).
 
 ## Setup
 
@@ -84,8 +87,9 @@ never resolved) are surfaced in the UI rather than silently dropped.
 ## Usage tracking
 
 If `MANHATTAN_USAGE_INGEST_URL` is set, the app forwards `app_opened`,
-`auth_success`/`auth_failed`, and `search_completed`/`search_failed`
-events to the Manhattan App Usage Dashboard's Neon ingest endpoint
+`auth_success`/`auth_failed`, `search_completed`/`search_failed`,
+`instruction_updated`/`instruction_update_failed`, and
+`instruction_deleted`/`instruction_delete_failed` events to the Manhattan App Usage Dashboard's Neon ingest endpoint
 (`app_name: "findinstructions-app"`). Forwarding is best-effort — a
 failed or unconfigured ingest never blocks the request it's attached to.
 
@@ -97,23 +101,46 @@ failed or unconfigured ingest never blocks the request it's attached to.
   call — reasonable for one order/oLPN's worth of data. If a search is
   truncated (very large fan-out), the "Raw API responses" panel will show it
   (`header.totalCount` vs. rows actually returned).
-- The only write call is the Instruction-text edit below.
+- The only write calls are the instruction edit and delete below; the
+  search/join itself is read-only.
 
-## Editing an instruction's text
+## Updating and deleting instructions
 
-Each result row's Instruction cell has a pencil icon. Clicking it opens an
-inline editor (Enter/✓ saves, Esc/✗ cancels) that changes **only**
-`InstructionText` on that one runtime `assignedInstruction` record — the
-master instruction definition is untouched. The backend
-(`update_instruction` action):
+Both actions act on **one runtime `assignedInstruction` record** (the
+instruction attached to that oLPN / oLPN detail), identified by its `PK`.
+The master instruction definition is never touched. Both endpoints live at
+`/pickpack/api/fw-aux-svcs/assignedInstruction/{PK}`, sent with the usual
+`selectedOrganization` / `selectedLocation` headers. Before either call the
+backend re-reads the record by `PK` (`assignedInstruction/search`,
+`Query: "PK=<pk>"`) and refuses to act unless exactly one record matches
+and it belongs to the current `{ORG}` / `{ORG}-DM1`.
 
-1. Re-reads the record by `PK` via `assignedInstruction/search` and checks
-   it belongs to the current `{ORG}` / `{ORG}-DM1`.
-2. `PUT /pickpack/api/fw-aux-svcs/assignedInstruction/{PK}` with the full
-   entity (`OrgId`, `FacilityId`, `InstructionId`, `InstructionText`,
-   `InstructionType`, `Sequence`, `InstructionRequestorTypeId`,
-   `InstructionRequestorId`, `PK`), only `InstructionText` changed. This
-   update-by-PK call came from a Glean conversation and was confirmed by
-   hand in Postman against SS-DEMO (2026-09-28).
-3. Re-reads the record and only reports success if the new text actually
-   persisted.
+### Edit (pencil icon → `update_instruction`)
+
+Opens an inline editor in the Instruction cell (Enter/✓ saves, Esc/✗
+cancels). Only `InstructionText` can be changed.
+
+- `PUT .../assignedInstruction/{PK}` with the full entity (`OrgId`,
+  `FacilityId`, `InstructionId`, `InstructionText`, `InstructionType`,
+  `Sequence`, `InstructionRequestorTypeId`, `InstructionRequestorId`, `PK`),
+  only `InstructionText` changed — the other values come from the fresh
+  read, not from the browser.
+- The record is re-read afterwards; success is only reported if the new
+  text actually persisted.
+- Evidence: from a Glean conversation, confirmed in Postman and then live
+  through this app against SS-DEMO oLPN `0000099999100015639`
+  (2026-09-28).
+
+### Delete (trash icon → `delete_instruction`)
+
+Opens a confirmation modal showing the instruction text and warning that
+the delete cannot be undone. Only **Delete** in that modal sends anything;
+Cancel, Esc, or clicking outside closes it.
+
+- `DELETE .../assignedInstruction/{PK}` (no body). A 2xx with an empty body
+  counts as success unless MAWM returns `success: false`.
+- The record is re-read afterwards; success is only reported if search no
+  longer returns it. The row(s) with that `PK` are then removed from the
+  table and the "Instructions found" count is updated.
+- Evidence: endpoint supplied by the user (2026-09-28); not yet exercised
+  against real data by this app.

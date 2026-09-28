@@ -35,7 +35,7 @@ const USERNAME_BASE = process.env.MANHATTAN_USERNAME_BASE || 'sdtadmin@';
 const USAGE_INGEST_URL = (process.env.MANHATTAN_USAGE_INGEST_URL || '').trim();
 const USAGE_INGEST_SECRET = (process.env.MANHATTAN_USAGE_INGEST_SECRET || '').trim();
 const APP_NAME = 'findinstructions-app';
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 
 async function forwardUsageEvent(payload) {
   if (!USAGE_INGEST_URL) {
@@ -59,8 +59,9 @@ const TASK_SEARCH_PATH = '/task/api/task/task/search';
 const OLPN_SEARCH_PATH = '/pickpack/api/pickpack/olpn/search';
 const ASSIGNED_INSTRUCTION_SEARCH_PATH = '/pickpack/api/fw-aux-svcs/assignedInstruction/search';
 // Update-by-PK: PUT {base}/{PK} with the full entity (PK in the body too),
-// only InstructionText changed. Taken from a Glean conversation and
-// confirmed by the user in Postman against SS-DEMO (2026-09-28).
+// only InstructionText changed. Taken from a Glean conversation, confirmed
+// by the user in Postman and then live through this app against SS-DEMO
+// (2026-09-28). Delete-by-PK: DELETE {base}/{PK} — supplied by the user.
 const ASSIGNED_INSTRUCTION_BASE_PATH = '/pickpack/api/fw-aux-svcs/assignedInstruction';
 const ASSIGNED_INSTRUCTION_ENTITY_FIELDS = [
   'OrgId', 'FacilityId', 'InstructionId', 'InstructionText', 'InstructionType',
@@ -165,7 +166,9 @@ async function mawmRequest(method, path, token, org, payload) {
     selectedLocation: `${orgUpper}-DM1`
   };
 
-  const res = await fetch(url, { method, headers, body: JSON.stringify(payload) });
+  const init = { method, headers };
+  if (payload !== undefined) init.body = JSON.stringify(payload);
+  const res = await fetch(url, init);
   if (res.status === 401) {
     throw new TokenInvalidError('MAWM rejected the current token (401) — it may have expired or been revoked.');
   }
@@ -507,12 +510,7 @@ async function updateInstructionText({ org, pk, instructionText }, token) {
   const putPath = `${ASSIGNED_INSTRUCTION_BASE_PATH}/${encodeURIComponent(pk)}`;
   const putResp = await mawmRequest('PUT', putPath, token, orgUpper, payload);
   if (!putResp.httpOk || putResp.parseError || putResp.success === false) {
-    const detail = putResp.message
-      || (putResp.errors && putResp.errors.length && JSON.stringify(putResp.errors))
-      || (putResp.messages && putResp.messages.Message && putResp.messages.Message.length && JSON.stringify(putResp.messages.Message))
-      || putResp.raw
-      || '';
-    return { success: false, error: `Update failed (HTTP ${putResp.httpStatus}) ${String(detail).slice(0, 400)}`.trim() };
+    return { success: false, error: `Update failed ${describeMawmFailure(putResp)}` };
   }
 
   // 3. Read back to confirm the change actually persisted.
@@ -529,6 +527,53 @@ async function updateInstructionText({ org, pk, instructionText }, token) {
     previousText: current.InstructionText,
     updatedTimestamp: updated.UpdatedTimestamp || null
   };
+}
+
+function describeMawmFailure(resp) {
+  const detail = resp.message
+    || (resp.errors && resp.errors.length && JSON.stringify(resp.errors))
+    || (resp.messages && resp.messages.Message && resp.messages.Message.length && JSON.stringify(resp.messages.Message))
+    || resp.raw
+    || '';
+  return `(HTTP ${resp.httpStatus}) ${String(detail).slice(0, 400)}`.trim();
+}
+
+async function deleteInstruction({ org, pk }, token) {
+  const orgUpper = org.toUpperCase();
+  const facilityId = `${orgUpper}-DM1`;
+
+  // 1. Confirm the record exists and belongs to this ORG/facility before
+  //    deleting anything — a DELETE can't be undone.
+  const before = await getAssignedInstructionByPk(orgUpper, pk, token);
+  if (before.rows.length !== 1) {
+    return {
+      success: false,
+      error: before.rows.length === 0
+        ? `Assigned instruction ${pk} not found.`
+        : `PK ${pk} matched more than one assigned instruction — not deleting.`
+    };
+  }
+  const current = before.rows[0];
+  if (current.OrgId !== orgUpper || current.FacilityId !== facilityId) {
+    return { success: false, error: `Instruction ${pk} belongs to ${current.OrgId}/${current.FacilityId}, not ${orgUpper}/${facilityId}.` };
+  }
+
+  // 2. DELETE by PK.
+  const delPath = `${ASSIGNED_INSTRUCTION_BASE_PATH}/${encodeURIComponent(pk)}`;
+  const delResp = await mawmRequest('DELETE', delPath, token, orgUpper);
+  // An empty 2xx body is a valid DELETE response — only fail on a non-2xx
+  // status or an explicit success:false.
+  if (!delResp.httpOk || delResp.success === false) {
+    return { success: false, error: `Delete failed ${describeMawmFailure(delResp)}` };
+  }
+
+  // 3. Read back to confirm it's actually gone.
+  const after = await getAssignedInstructionByPk(orgUpper, pk, token);
+  if (after.rows.length > 0) {
+    return { success: false, error: 'MAWM accepted the delete, but the instruction is still returned by search.' };
+  }
+
+  return { success: true, pk: String(pk), deletedText: current.InstructionText };
 }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +683,28 @@ async function handler(req, res) {
       console.error('[update_instruction] error:', e);
       await forwardUsageEvent({ event_name: 'instruction_update_failed', org: String(org).toUpperCase(), error: e.message });
       return res.json({ success: false, error: e.message || 'Update failed', tokenInvalid: !!e.tokenInvalid });
+    }
+  }
+
+  if (action === 'delete_instruction') {
+    const org = req.body.org;
+    const pk = req.body.pk != null ? String(req.body.pk).trim() : '';
+
+    if (!org || !String(org).trim()) return res.status(400).json({ success: false, error: 'ORG required' });
+    if (!/^-?\d+$/.test(pk)) return res.status(400).json({ success: false, error: 'A numeric instruction PK is required' });
+
+    try {
+      const result = await deleteInstruction({ org, pk }, token);
+      await forwardUsageEvent({
+        event_name: result.success ? 'instruction_deleted' : 'instruction_delete_failed',
+        org: String(org).toUpperCase(),
+        ...(result.success ? {} : { error: result.error })
+      });
+      return res.json(result);
+    } catch (e) {
+      console.error('[delete_instruction] error:', e);
+      await forwardUsageEvent({ event_name: 'instruction_delete_failed', org: String(org).toUpperCase(), error: e.message });
+      return res.json({ success: false, error: e.message || 'Delete failed', tokenInvalid: !!e.tokenInvalid });
     }
   }
 
