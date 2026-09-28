@@ -166,7 +166,7 @@ function renderResults(res) {
       tr.innerHTML = [
         row.Sequence,
         escapeHtml(row.InstructionType),
-        escapeHtml(row.InstructionText),
+        '', // Instruction cell — filled by renderInstructionCell below
         escapeHtml(row.OrderId),
         escapeHtml(row.OrderLineId),
         escapeHtml(row.ItemId),
@@ -180,6 +180,10 @@ function renderResults(res) {
         escapeHtml(row.InstructionRequestorId),
         escapeHtml(row.Process)
       ].map((v) => `<td>${v == null || v === '' ? '&mdash;' : v}</td>`).join('');
+      const instructionCell = tr.children[2];
+      instructionCell.classList.add('instruction-cell');
+      instructionCell.dataset.pk = row.PK != null ? String(row.PK) : '';
+      renderInstructionCell(instructionCell, row.InstructionText);
       resultsBody.appendChild(tr);
     }
   }
@@ -207,6 +211,85 @@ function renderResults(res) {
 
   rawOutput.textContent = JSON.stringify(res.raw || {}, null, 2);
   resultsEl.style.display = 'block';
+}
+
+// Instruction cell: text + pencil icon; clicking the pencil swaps in an
+// inline editor that saves only InstructionText (by PK) via the backend.
+function renderInstructionCell(cell, text) {
+  cell.dataset.text = text == null ? '' : String(text);
+  const canEdit = !!cell.dataset.pk;
+  cell.innerHTML =
+    `<span class="instruction-text">${text == null || text === '' ? '&mdash;' : escapeHtml(text)}</span>` +
+    (canEdit
+      ? ` <button type="button" class="btn btn-link btn-sm p-0 ms-1 edit-instruction-btn" title="Edit instruction text"><i class="fas fa-pencil-alt"></i></button>`
+      : '');
+  if (canEdit) {
+    cell.querySelector('.edit-instruction-btn').addEventListener('click', () => openInstructionEditor(cell));
+  }
+}
+
+function openInstructionEditor(cell) {
+  const original = cell.dataset.text;
+  cell.innerHTML = `
+    <div class="d-flex gap-1 align-items-center instruction-editor">
+      <input type="text" class="form-control form-control-sm" maxlength="500" />
+      <button type="button" class="btn btn-success btn-sm save-btn" title="Save"><i class="fas fa-check"></i></button>
+      <button type="button" class="btn btn-outline-secondary btn-sm cancel-btn" title="Cancel"><i class="fas fa-times"></i></button>
+    </div>`;
+  const input = cell.querySelector('input');
+  const saveBtn = cell.querySelector('.save-btn');
+  const cancelBtn = cell.querySelector('.cancel-btn');
+  input.value = original;
+  input.focus();
+  input.select();
+
+  const cancel = () => renderInstructionCell(cell, original);
+  const save = async () => {
+    const newText = input.value.trim();
+    if (!newText) {
+      showStatus('Instruction text cannot be empty.', 'error');
+      return;
+    }
+    if (newText === original) {
+      cancel();
+      return;
+    }
+    input.disabled = saveBtn.disabled = cancelBtn.disabled = true;
+    saveBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+    try {
+      const res = await apiCall('update_instruction', { org: currentOrg, pk: cell.dataset.pk, instructionText: newText });
+      if (!res.success) {
+        if (res.tokenInvalid) {
+          token = null;
+          mainUI.style.display = 'none';
+          authSection.style.display = 'block';
+          showAuthStatus('Saved token expired or was rejected — please re-authenticate.', 'error');
+          return;
+        }
+        showStatus(res.error || 'Update failed', 'error');
+        input.disabled = saveBtn.disabled = cancelBtn.disabled = false;
+        saveBtn.innerHTML = '<i class="fas fa-check"></i>';
+        return;
+      }
+      // Same PK can appear on more than one row — update them all.
+      document.querySelectorAll('td.instruction-cell').forEach((c) => {
+        if (c.dataset.pk === cell.dataset.pk) renderInstructionCell(c, res.instructionText);
+      });
+      showStatus(`Instruction updated: "${res.previousText}" → "${res.instructionText}"`, 'success');
+    } catch (error) {
+      console.error('Update error:', error);
+      showStatus(error.message || 'Update failed', 'error');
+      input.disabled = saveBtn.disabled = cancelBtn.disabled = false;
+      saveBtn.innerHTML = '<i class="fas fa-check"></i>';
+    }
+  };
+
+  saveBtn.addEventListener('click', save);
+  cancelBtn.addEventListener('click', cancel);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') save();
+    else if (e.key === 'Escape') cancel();
+  });
 }
 
 async function runSearch(mode, value) {

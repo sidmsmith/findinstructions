@@ -97,4 +97,23 @@ failed or unconfigured ingest never blocks the request it's attached to.
   call — reasonable for one order/oLPN's worth of data. If a search is
   truncated (very large fan-out), the "Raw API responses" panel will show it
   (`header.totalCount` vs. rows actually returned).
-- No write calls are made anywhere in this app.
+- The only write call is the Instruction-text edit below.
+
+## Editing an instruction's text
+
+Each result row's Instruction cell has a pencil icon. Clicking it opens an
+inline editor (Enter/✓ saves, Esc/✗ cancels) that changes **only**
+`InstructionText` on that one runtime `assignedInstruction` record — the
+master instruction definition is untouched. The backend
+(`update_instruction` action):
+
+1. Re-reads the record by `PK` via `assignedInstruction/search` and checks
+   it belongs to the current `{ORG}` / `{ORG}-DM1`.
+2. `PUT /pickpack/api/fw-aux-svcs/assignedInstruction/{PK}` with the full
+   entity (`OrgId`, `FacilityId`, `InstructionId`, `InstructionText`,
+   `InstructionType`, `Sequence`, `InstructionRequestorTypeId`,
+   `InstructionRequestorId`, `PK`), only `InstructionText` changed. This
+   update-by-PK call came from a Glean conversation and was confirmed by
+   hand in Postman against SS-DEMO (2026-09-28).
+3. Re-reads the record and only reports success if the new text actually
+   persisted.

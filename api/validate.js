@@ -35,7 +35,7 @@ const USERNAME_BASE = process.env.MANHATTAN_USERNAME_BASE || 'sdtadmin@';
 const USAGE_INGEST_URL = (process.env.MANHATTAN_USAGE_INGEST_URL || '').trim();
 const USAGE_INGEST_SECRET = (process.env.MANHATTAN_USAGE_INGEST_SECRET || '').trim();
 const APP_NAME = 'findinstructions-app';
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 
 async function forwardUsageEvent(payload) {
   if (!USAGE_INGEST_URL) {
@@ -58,6 +58,14 @@ async function forwardUsageEvent(payload) {
 const TASK_SEARCH_PATH = '/task/api/task/task/search';
 const OLPN_SEARCH_PATH = '/pickpack/api/pickpack/olpn/search';
 const ASSIGNED_INSTRUCTION_SEARCH_PATH = '/pickpack/api/fw-aux-svcs/assignedInstruction/search';
+// Update-by-PK: PUT {base}/{PK} with the full entity (PK in the body too),
+// only InstructionText changed. Taken from a Glean conversation and
+// confirmed by the user in Postman against SS-DEMO (2026-09-28).
+const ASSIGNED_INSTRUCTION_BASE_PATH = '/pickpack/api/fw-aux-svcs/assignedInstruction';
+const ASSIGNED_INSTRUCTION_ENTITY_FIELDS = [
+  'OrgId', 'FacilityId', 'InstructionId', 'InstructionText', 'InstructionType',
+  'Sequence', 'InstructionRequestorTypeId', 'InstructionRequestorId', 'PK'
+];
 
 // olpn_status domain, CONFIRMED (mawm_api_library/_conventions/statuses.md
 // "### oLPN"). A re-waved/unwaved order leaves behind oLPN records from
@@ -144,6 +152,10 @@ async function getToken(org) {
 }
 
 async function mawmPost(path, token, org, payload) {
+  return mawmRequest('POST', path, token, org, payload);
+}
+
+async function mawmRequest(method, path, token, org, payload) {
   const orgUpper = org.toUpperCase();
   const url = `https://${API_HOST}${path}`;
   const headers = {
@@ -153,7 +165,7 @@ async function mawmPost(path, token, org, payload) {
     selectedLocation: `${orgUpper}-DM1`
   };
 
-  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
+  const res = await fetch(url, { method, headers, body: JSON.stringify(payload) });
   if (res.status === 401) {
     throw new TokenInvalidError('MAWM rejected the current token (401) — it may have expired or been revoked.');
   }
@@ -453,6 +465,73 @@ async function findInstructions({ org, mode, value }, token) {
 }
 
 // ---------------------------------------------------------------------------
+// Update one assigned instruction's text
+// ---------------------------------------------------------------------------
+
+async function getAssignedInstructionByPk(orgUpper, pk, token) {
+  const template = {};
+  for (const f of ASSIGNED_INSTRUCTION_ENTITY_FIELDS) template[f] = null;
+  template.UpdatedTimestamp = null;
+  const resp = await mawmPost(ASSIGNED_INSTRUCTION_SEARCH_PATH, token, orgUpper, {
+    Query: `PK=${escapeQuoted(pk)}`,
+    Template: template,
+    Size: 2
+  });
+  return { resp, rows: dataRows(resp) };
+}
+
+async function updateInstructionText({ org, pk, instructionText }, token) {
+  const orgUpper = org.toUpperCase();
+  const facilityId = `${orgUpper}-DM1`;
+
+  // 1. Re-read the current record by PK so the PUT carries MAWM's current
+  //    values for every other field, not whatever the browser last saw.
+  const before = await getAssignedInstructionByPk(orgUpper, pk, token);
+  if (before.rows.length !== 1) {
+    return {
+      success: false,
+      error: before.rows.length === 0
+        ? `Assigned instruction ${pk} not found.`
+        : `PK ${pk} matched more than one assigned instruction — not updating.`
+    };
+  }
+  const current = before.rows[0];
+  if (current.OrgId !== orgUpper || current.FacilityId !== facilityId) {
+    return { success: false, error: `Instruction ${pk} belongs to ${current.OrgId}/${current.FacilityId}, not ${orgUpper}/${facilityId}.` };
+  }
+
+  // 2. PUT the full entity with only InstructionText changed.
+  const payload = {};
+  for (const f of ASSIGNED_INSTRUCTION_ENTITY_FIELDS) payload[f] = current[f];
+  payload.InstructionText = instructionText;
+  const putPath = `${ASSIGNED_INSTRUCTION_BASE_PATH}/${encodeURIComponent(pk)}`;
+  const putResp = await mawmRequest('PUT', putPath, token, orgUpper, payload);
+  if (!putResp.httpOk || putResp.parseError || putResp.success === false) {
+    const detail = putResp.message
+      || (putResp.errors && putResp.errors.length && JSON.stringify(putResp.errors))
+      || (putResp.messages && putResp.messages.Message && putResp.messages.Message.length && JSON.stringify(putResp.messages.Message))
+      || putResp.raw
+      || '';
+    return { success: false, error: `Update failed (HTTP ${putResp.httpStatus}) ${String(detail).slice(0, 400)}`.trim() };
+  }
+
+  // 3. Read back to confirm the change actually persisted.
+  const after = await getAssignedInstructionByPk(orgUpper, pk, token);
+  const updated = after.rows[0];
+  if (!updated || updated.InstructionText !== instructionText) {
+    return { success: false, error: 'MAWM accepted the update, but re-reading the instruction shows the text did not change.' };
+  }
+
+  return {
+    success: true,
+    pk: updated.PK,
+    instructionText: updated.InstructionText,
+    previousText: current.InstructionText,
+    updatedTimestamp: updated.UpdatedTimestamp || null
+  };
+}
+
+// ---------------------------------------------------------------------------
 // HTTP handler
 // ---------------------------------------------------------------------------
 
@@ -535,6 +614,30 @@ async function handler(req, res) {
       console.error('[search] error:', e);
       await forwardUsageEvent({ event_name: 'search_failed', org: String(org).toUpperCase(), mode, error: e.message });
       return res.json({ success: false, error: e.message || 'Search failed', tokenInvalid: !!e.tokenInvalid });
+    }
+  }
+
+  if (action === 'update_instruction') {
+    const org = req.body.org;
+    const pk = req.body.pk != null ? String(req.body.pk).trim() : '';
+    const instructionText = req.body.instructionText != null ? String(req.body.instructionText).trim() : '';
+
+    if (!org || !String(org).trim()) return res.status(400).json({ success: false, error: 'ORG required' });
+    if (!/^-?\d+$/.test(pk)) return res.status(400).json({ success: false, error: 'A numeric instruction PK is required' });
+    if (!instructionText) return res.status(400).json({ success: false, error: 'Instruction text cannot be empty' });
+
+    try {
+      const result = await updateInstructionText({ org, pk, instructionText }, token);
+      await forwardUsageEvent({
+        event_name: result.success ? 'instruction_updated' : 'instruction_update_failed',
+        org: String(org).toUpperCase(),
+        ...(result.success ? {} : { error: result.error })
+      });
+      return res.json(result);
+    } catch (e) {
+      console.error('[update_instruction] error:', e);
+      await forwardUsageEvent({ event_name: 'instruction_update_failed', org: String(org).toUpperCase(), error: e.message });
+      return res.json({ success: false, error: e.message || 'Update failed', tokenInvalid: !!e.tokenInvalid });
     }
   }
 
