@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Find Instructions v1.4.0</title>
+  <title>Find Instructions v1.5.0</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <style>
@@ -102,6 +102,8 @@
       padding: 1.5rem;
     }
     .confirm-dialog h5 { color: var(--danger-color); }
+    .create-dialog h5 { color: var(--primary-color); }
+    .add-bar .btn { margin: 0 0.5rem 0.25rem 0; }
     .confirm-dialog blockquote {
       background: var(--card-bg);
       border-left: 4px solid var(--danger-color);
@@ -150,6 +152,7 @@
 
         <div id="results" style="display: none;">
           <div class="counts-row mb-2"></div>
+          <div id="addBar" class="add-bar mb-2"></div>
           <div class="table-responsive">
             <table class="table table-sm table-bordered instructions-table">
               <thead>
@@ -185,6 +188,42 @@
             <pre id="rawOutput"></pre>
           </details>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="createModal" class="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="createModalTitle">
+    <div class="confirm-dialog create-dialog">
+      <h5 id="createModalTitle"><i class="fas fa-plus-circle"></i> Add instruction</h5>
+      <p class="small text-muted mb-3">oLPN <strong id="createOlpnId"></strong></p>
+      <div id="createLoading" class="status info">Loading oLPN details...</div>
+      <div id="createForm" style="display: none;">
+        <div class="mb-2">
+          <label class="form-label mb-1" for="createTarget">Attach to</label>
+          <select id="createTarget" class="form-select form-select-sm"></select>
+        </div>
+        <div class="d-flex gap-2 mb-2">
+          <div class="flex-fill">
+            <label class="form-label mb-1" for="createType">Type</label>
+            <select id="createType" class="form-select form-select-sm">
+              <option value="Pick">Pick</option>
+              <option value="Pack">Pack</option>
+            </select>
+          </div>
+          <div style="width: 110px;">
+            <label class="form-label mb-1" for="createSeq">Sequence</label>
+            <input id="createSeq" type="number" min="1" step="1" class="form-control form-control-sm" />
+          </div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label mb-1" for="createText">Instruction text</label>
+          <input id="createText" type="text" maxlength="500" class="form-control form-control-sm" placeholder="e.g. Wrap in plastic" />
+        </div>
+      </div>
+      <div id="createModalError" class="status error" style="display: none;"></div>
+      <div class="d-flex justify-content-end gap-2">
+        <button id="createCancelBtn" type="button" class="btn btn-outline-secondary">Cancel</button>
+        <button id="createConfirmBtn" type="button" class="btn btn-primary" disabled><i class="fas fa-plus"></i> Create</button>
       </div>
     </div>
   </div>

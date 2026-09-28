@@ -35,7 +35,7 @@ const USERNAME_BASE = process.env.MANHATTAN_USERNAME_BASE || 'sdtadmin@';
 const USAGE_INGEST_URL = (process.env.MANHATTAN_USAGE_INGEST_URL || '').trim();
 const USAGE_INGEST_SECRET = (process.env.MANHATTAN_USAGE_INGEST_SECRET || '').trim();
 const APP_NAME = 'findinstructions-app';
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.5.0';
 
 async function forwardUsageEvent(payload) {
   if (!USAGE_INGEST_URL) {
@@ -63,6 +63,11 @@ const ASSIGNED_INSTRUCTION_SEARCH_PATH = '/pickpack/api/fw-aux-svcs/assignedInst
 // by the user in Postman and then live through this app against SS-DEMO
 // (2026-09-28). Delete-by-PK: DELETE {base}/{PK} — supplied by the user.
 const ASSIGNED_INSTRUCTION_BASE_PATH = '/pickpack/api/fw-aux-svcs/assignedInstruction';
+// Create: POST {base}/save with no PK (MAWM generates it). Taken from a
+// Glean conversation (2026-09-28); first exercised through this app's
+// Add-instruction modal.
+const ASSIGNED_INSTRUCTION_SAVE_PATH = '/pickpack/api/fw-aux-svcs/assignedInstruction/save';
+const INSTRUCTION_TYPES = ['Pick', 'Pack'];
 const ASSIGNED_INSTRUCTION_ENTITY_FIELDS = [
   'OrgId', 'FacilityId', 'InstructionId', 'InstructionText', 'InstructionType',
   'Sequence', 'InstructionRequestorTypeId', 'InstructionRequestorId', 'PK'
@@ -263,6 +268,7 @@ async function findInstructions({ org, mode, value }, token) {
   const olpnsNotFound = [];
   const olpnsExcludedCancelled = []; // { olpnId, status } — found, but Status='9000' (Cancelled)
   const olpnStatusById = new Map();
+  const activeOlpns = []; // { olpnId, status } — found and not Cancelled
   const olpnRaw = {};
 
   for (const olpnId of olpnIds) {
@@ -297,6 +303,7 @@ async function findInstructions({ org, mode, value }, token) {
         continue;
       }
       activeRows.push(row);
+      if (!activeOlpns.some((o) => o.olpnId === olpnId)) activeOlpns.push({ olpnId, status });
     }
 
     for (const row of activeRows) {
@@ -448,6 +455,7 @@ async function findInstructions({ org, mode, value }, token) {
     mode,
     value,
     instructions: flattened,
+    activeOlpns,
     counts: {
       taskDetails: taskDetails.length,
       olpnsLooked: olpnIds.size,
@@ -603,6 +611,154 @@ async function deleteInstruction({ org, pk }, token) {
 }
 
 // ---------------------------------------------------------------------------
+// Create a new assigned instruction on an oLPN header or detail
+// ---------------------------------------------------------------------------
+
+// Every oLPN and oLPN detail has an instruction requestor ID from birth,
+// whether or not it has instructions yet. MAWM returns them as one
+// comma-separated string: the header's ID first, then one per OlpnDetail in
+// the same order as the OlpnDetail[] array. OBSERVED on SS-DEMO oLPN
+// 0000099999100015639 (known detail-2 requestor sits at position 2 of the
+// detail IDs) and 0000099999100015677 (1 detail, 2 IDs). Because that order
+// rests on limited evidence, createInstruction() re-reads the oLPN after
+// saving and checks the instruction landed under the intended target.
+async function readOlpnWithRequestors(orgUpper, olpnId, token) {
+  const resp = await mawmPost(OLPN_SEARCH_PATH, token, orgUpper, {
+    Query: `OlpnId ='${escapeQuoted(olpnId)}'`,
+    Template: {
+      OlpnId: null,
+      Status: null,
+      OlpnAndDetailsServiceRequestorIds: null,
+      AssignedInstruction: null,
+      OlpnDetail: { OlpnDetailId: null, ItemId: null, AssignedInstruction: null }
+    },
+    Size: 50
+  });
+  const rows = dataRows(resp).filter((r) => String(r.Status) !== OLPN_CANCELLED_STATUS);
+  if (rows.length === 0) {
+    return { error: dataRows(resp).length ? `oLPN ${olpnId} is Cancelled.` : `oLPN ${olpnId} not found.` };
+  }
+  if (rows.length > 1) return { error: `oLPN ${olpnId} matched more than one active record — not changing it.` };
+  const row = rows[0];
+
+  const ids = String(row.OlpnAndDetailsServiceRequestorIds || '').split(',').map((x) => x.trim()).filter(Boolean);
+  const details = asArray(row.OlpnDetail);
+  if (ids.length !== details.length + 1) {
+    return {
+      error: `oLPN ${olpnId} returned ${ids.length} requestor ID(s) for 1 header + ${details.length} detail(s); ` +
+        'cannot tell which ID belongs to which target, so not creating anything.'
+    };
+  }
+
+  const targets = [
+    { type: 'Olpn', requestorId: ids[0], olpnDetailId: null, itemId: null, label: 'oLPN header', existing: asArray(row.AssignedInstruction) }
+  ];
+  details.forEach((d, i) => {
+    targets.push({
+      type: 'OlpnDetail',
+      requestorId: ids[i + 1],
+      olpnDetailId: d.OlpnDetailId != null ? String(d.OlpnDetailId) : null,
+      itemId: d.ItemId || null,
+      label: `Detail ${d.OlpnDetailId} – Item ${d.ItemId || '?'}`,
+      existing: asArray(d.AssignedInstruction)
+    });
+  });
+  return { row, targets };
+}
+
+async function getOlpnTargets({ org, olpnId }, token) {
+  const orgUpper = org.toUpperCase();
+  const r = await readOlpnWithRequestors(orgUpper, olpnId, token);
+  if (r.error) return { success: false, error: r.error };
+  return {
+    success: true,
+    olpnId: r.row.OlpnId,
+    status: r.row.Status != null ? String(r.row.Status) : null,
+    targets: r.targets.map((t) => ({
+      type: t.type,
+      olpnDetailId: t.olpnDetailId,
+      itemId: t.itemId,
+      label: t.label,
+      existingCount: t.existing.length,
+      nextSequence: t.existing.reduce((m, a) => Math.max(m, Number(a.Sequence) || 0), 0) + 1
+    }))
+  };
+}
+
+async function createInstruction({ org, olpnId, targetType, olpnDetailId, instructionType, instructionText, sequence }, token) {
+  const orgUpper = org.toUpperCase();
+
+  // 1. Resolve the requestor ID server-side — never trust one from the browser.
+  const before = await readOlpnWithRequestors(orgUpper, olpnId, token);
+  if (before.error) return { success: false, error: before.error };
+  const target = before.targets.find((t) =>
+    t.type === targetType && (targetType === 'Olpn' || t.olpnDetailId === String(olpnDetailId))
+  );
+  if (!target) return { success: false, error: `oLPN ${olpnId} has no ${targetType === 'Olpn' ? 'header' : `detail ${olpnDetailId}`} target.` };
+
+  // InstructionId = the text, matching existing records (e.g. "Wrap in
+  // plastic"). It must be unique per requestor, so reject a duplicate here
+  // with a clear message rather than relying on MAWM's duplicate-key error.
+  const instructionId = instructionText;
+  if (target.existing.some((a) => a.InstructionId === instructionId)) {
+    return { success: false, error: `${target.label} already has an instruction "${instructionText}".` };
+  }
+
+  // 2. Create. No PK — MAWM generates it; OrgId/FacilityId come from headers.
+  const payload = {
+    InstructionRequestorId: target.requestorId,
+    InstructionRequestorTypeId: target.type,
+    InstructionType: instructionType,
+    InstructionId: instructionId,
+    InstructionText: instructionText,
+    Sequence: sequence
+  };
+  const saveResp = await mawmPost(ASSIGNED_INSTRUCTION_SAVE_PATH, token, orgUpper, payload);
+  if (!saveResp.httpOk || saveResp.parseError || saveResp.success === false) {
+    return { success: false, error: `Create failed ${describeMawmFailure(saveResp)}` };
+  }
+  const savedPk = saveResp.data && !Array.isArray(saveResp.data) && saveResp.data.PK ? String(saveResp.data.PK) : null;
+
+  // 3. Confirm the record exists in the instruction store.
+  const findResp = await mawmPost(ASSIGNED_INSTRUCTION_SEARCH_PATH, token, orgUpper, {
+    Query: `InstructionRequestorTypeId='${target.type}' and InstructionRequestorId='${escapeQuoted(target.requestorId)}' ` +
+      `and InstructionId='${escapeQuoted(instructionId)}'`,
+    Size: 5
+  });
+  const created = dataRows(findResp).find((r) => !savedPk || String(r.PK) === savedPk);
+  if (!created) {
+    return { success: false, error: 'MAWM accepted the create, but the new instruction could not be found afterwards.' };
+  }
+  const pk = String(created.PK);
+
+  // 4. Confirm it shows up under the intended target on the oLPN — this is
+  //    what the search join reads, and it checks the requestor-ID mapping.
+  const after = await readOlpnWithRequestors(orgUpper, olpnId, token);
+  let landedOn = null;
+  if (!after.error) {
+    const hit = after.targets.find((t) => t.existing.some((a) => String(a.PK) === pk));
+    landedOn = hit ? hit.label : null;
+  }
+  if (landedOn && landedOn !== target.label) {
+    return {
+      success: false,
+      pk,
+      error: `Created instruction ${pk}, but it appears under "${landedOn}" instead of "${target.label}". ` +
+        'Delete it from the results table and report this — the requestor-ID mapping is wrong for this oLPN.'
+    };
+  }
+
+  return {
+    success: true,
+    pk,
+    target: target.label,
+    instructionText: created.InstructionText,
+    // false => saved, but the oLPN doesn't list it yet, so a search won't show it
+    visibleOnOlpn: !!landedOn
+  };
+}
+
+// ---------------------------------------------------------------------------
 // HTTP handler
 // ---------------------------------------------------------------------------
 
@@ -689,22 +845,60 @@ async function handler(req, res) {
     }
   }
 
-  // Read-only: the full oLPN record (no Template) for one oLPN, used to work
-  // out how OlpnAndDetailsServiceRequestorIds maps to the header and each
-  // OlpnDetail before building "create instruction".
   if (action === 'olpn_targets') {
     const org = req.body.org;
     const olpnId = req.body.olpnId != null ? String(req.body.olpnId).trim() : '';
     if (!org || !String(org).trim()) return res.status(400).json({ success: false, error: 'ORG required' });
     if (!olpnId) return res.status(400).json({ success: false, error: 'olpnId required' });
     try {
-      const resp = await mawmPost(OLPN_SEARCH_PATH, token, String(org).toUpperCase(), {
-        Query: `OlpnId ='${escapeQuoted(olpnId)}'`,
-        Size: 5
-      });
-      return res.json({ success: resp.httpOk && resp.success !== false, httpStatus: resp.httpStatus, rows: dataRows(resp) });
+      return res.json(await getOlpnTargets({ org, olpnId }, token));
     } catch (e) {
-      return res.json({ success: false, error: e.message, tokenInvalid: !!e.tokenInvalid });
+      console.error('[olpn_targets] error:', e);
+      return res.json({ success: false, error: e.message || 'Lookup failed', tokenInvalid: !!e.tokenInvalid });
+    }
+  }
+
+  if (action === 'create_instruction') {
+    const org = req.body.org;
+    const olpnId = req.body.olpnId != null ? String(req.body.olpnId).trim() : '';
+    const targetType = req.body.targetType;
+    const olpnDetailId = req.body.olpnDetailId != null ? String(req.body.olpnDetailId).trim() : '';
+    const instructionType = req.body.instructionType;
+    const instructionText = req.body.instructionText != null ? String(req.body.instructionText).trim() : '';
+    const sequence = Number(req.body.sequence);
+
+    if (!org || !String(org).trim()) return res.status(400).json({ success: false, error: 'ORG required' });
+    if (!olpnId) return res.status(400).json({ success: false, error: 'olpnId required' });
+    if (targetType !== 'Olpn' && targetType !== 'OlpnDetail') {
+      return res.status(400).json({ success: false, error: "targetType must be 'Olpn' or 'OlpnDetail'" });
+    }
+    if (targetType === 'OlpnDetail' && !olpnDetailId) {
+      return res.status(400).json({ success: false, error: 'olpnDetailId required for a detail-level instruction' });
+    }
+    if (!INSTRUCTION_TYPES.includes(instructionType)) {
+      return res.status(400).json({ success: false, error: `instructionType must be one of ${INSTRUCTION_TYPES.join(', ')}` });
+    }
+    if (!instructionText) return res.status(400).json({ success: false, error: 'Instruction text cannot be empty' });
+    if (!Number.isInteger(sequence) || sequence < 1) {
+      return res.status(400).json({ success: false, error: 'Sequence must be a whole number of 1 or more' });
+    }
+
+    try {
+      const result = await createInstruction(
+        { org, olpnId, targetType, olpnDetailId, instructionType, instructionText, sequence },
+        token
+      );
+      await forwardUsageEvent({
+        event_name: result.success ? 'instruction_created' : 'instruction_create_failed',
+        org: String(org).toUpperCase(),
+        targetType,
+        ...(result.success ? {} : { error: result.error })
+      });
+      return res.json(result);
+    } catch (e) {
+      console.error('[create_instruction] error:', e);
+      await forwardUsageEvent({ event_name: 'instruction_create_failed', org: String(org).toUpperCase(), error: e.message });
+      return res.json({ success: false, error: e.message || 'Create failed', tokenInvalid: !!e.tokenInvalid });
     }
   }
 

@@ -2,10 +2,11 @@
 
 Enter a MAWM Order ID or oLPN ID and see every runtime `assignedInstruction`
 record linked to it (Pick and Pack), joined back to the Order Line, Task,
-oLPN, and oLPN Detail that produced it. Each instruction can also be
-**edited** (pencil icon — instruction text only) or **deleted** (trash icon,
-behind a confirmation) directly from the results table — see
-[Updating and deleting instructions](#updating-and-deleting-instructions).
+oLPN, and oLPN Detail that produced it. From the results you can also
+**add** a new instruction to any oLPN (header or a specific detail), and
+**edit** (pencil icon — instruction text only) or **delete** (trash icon,
+behind a confirmation) an existing one — see
+[Creating, updating and deleting instructions](#creating-updating-and-deleting-instructions).
 
 ## Setup
 
@@ -106,8 +107,10 @@ never resolved) are surfaced in the UI rather than silently dropped.
 
 If `MANHATTAN_USAGE_INGEST_URL` is set, the app forwards `app_opened`,
 `auth_success`/`auth_failed`, `search_completed`/`search_failed`,
+`instruction_created`/`instruction_create_failed`,
 `instruction_updated`/`instruction_update_failed`, and
-`instruction_deleted`/`instruction_delete_failed` events to the Manhattan App Usage Dashboard's Neon ingest endpoint
+`instruction_deleted`/`instruction_delete_failed` events to the Manhattan
+App Usage Dashboard's Neon ingest endpoint
 (`app_name: "findinstructions-app"`). Forwarding is best-effort — a
 failed or unconfigured ingest never blocks the request it's attached to.
 
@@ -119,10 +122,53 @@ failed or unconfigured ingest never blocks the request it's attached to.
   call — reasonable for one order/oLPN's worth of data. If a search is
   truncated (very large fan-out), the "Raw API responses" panel will show it
   (`header.totalCount` vs. rows actually returned).
-- The only write calls are the instruction edit and delete below; the
-  search/join itself is read-only.
+- The only write calls are the instruction create, edit and delete
+  below; the search/join itself is read-only.
 
-## Updating and deleting instructions
+## Creating, updating and deleting instructions
+
+### Create ("Add instruction to oLPN …" → `olpn_targets` + `create_instruction`)
+
+The results show one **Add instruction** button per active (non-Cancelled)
+oLPN found — including oLPNs with no instructions yet. It opens a modal:
+
+- **Attach to** — "oLPN header" or "Detail N – Item X" (with a count of
+  existing instructions on each).
+- **Type** — Pick or Pack.
+- **Sequence** — pre-filled with the next free number for that target.
+- **Instruction text**.
+
+How the target is resolved: every oLPN and oLPN detail has an
+*instruction requestor ID* from the moment it exists, whether or not it
+has instructions. `olpn/search` with `OlpnAndDetailsServiceRequestorIds`
+in the `Template` returns them as one comma-separated string — the
+header's ID first, then one per `OlpnDetail` in array order (observed on
+SS-DEMO oLPNs `0000099999100015639` and `0000099999100015677`). If the
+ID count isn't exactly 1 + number of details, the app refuses to create.
+The ID is resolved on the server at create time, never taken from the
+browser.
+
+The backend (`create_instruction`):
+
+1. Re-reads the oLPN, resolves the chosen target's requestor ID, and
+   rejects a duplicate `InstructionId` on that target.
+2. `POST /pickpack/api/fw-aux-svcs/assignedInstruction/save` with
+   `InstructionRequestorId`, `InstructionRequestorTypeId` (`Olpn` or
+   `OlpnDetail`), `InstructionType`, `InstructionId`, `InstructionText`,
+   `Sequence` — **no `PK`** (MAWM generates it) and no `OrgId`/`FacilityId`
+   (taken from the headers). `InstructionId` is set to the instruction
+   text, matching existing records.
+3. Finds the new record via `assignedInstruction/search`.
+4. Re-reads the oLPN and checks the new instruction appears under the
+   **intended** target. If it shows up elsewhere, it reports an error with
+   the new PK so it can be deleted; if the oLPN doesn't list it at all
+   yet, it reports a warning (it won't appear in search results).
+5. The UI then re-runs the search so the new row appears fully joined.
+
+Evidence: endpoint and payload from a Glean conversation (2026-09-28);
+first exercised through this modal.
+
+### Update and delete
 
 Both actions act on **one runtime `assignedInstruction` record** (the
 instruction attached to that oLPN / oLPN detail), identified by its `PK`.
@@ -160,5 +206,5 @@ Cancel, Esc, or clicking outside closes it.
 - The record is re-read afterwards; success is only reported if search no
   longer returns it. The row(s) with that `PK` are then removed from the
   table and the "Instructions found" count is updated.
-- Evidence: endpoint supplied by the user (2026-09-28); not yet exercised
-  against real data by this app.
+- Evidence: endpoint supplied by the user and confirmed working through
+  this app against SS-DEMO (2026-09-28).

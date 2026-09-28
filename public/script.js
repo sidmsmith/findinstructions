@@ -14,6 +14,8 @@ const countsRow = document.querySelector('.counts-row');
 const unmatchedSection = document.getElementById('unmatchedSection');
 const unmatchedList = document.getElementById('unmatchedList');
 const rawOutput = document.getElementById('rawOutput');
+const addBar = document.getElementById('addBar');
+let lastSearchValue = null;
 
 function showAuthStatus(message, type) {
   authStatusEl.textContent = message;
@@ -189,8 +191,149 @@ function renderResults(res) {
   }
 
   rawOutput.textContent = JSON.stringify(res.raw || {}, null, 2);
+  renderAddBar(res.activeOlpns || []);
   resultsEl.style.display = 'block';
 }
+
+// One "Add instruction" button per active oLPN in the results — including
+// oLPNs that have no instructions yet.
+function renderAddBar(olpns) {
+  addBar.innerHTML = '';
+  for (const o of olpns) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn-outline-primary btn-sm';
+    btn.innerHTML = `<i class="fas fa-plus"></i> Add instruction to oLPN ${escapeHtml(o.olpnId)}`;
+    btn.addEventListener('click', () => openCreateModal(o.olpnId));
+    addBar.appendChild(btn);
+  }
+}
+
+// ---- Create instruction modal ----
+const createModal = document.getElementById('createModal');
+const createOlpnIdEl = document.getElementById('createOlpnId');
+const createLoading = document.getElementById('createLoading');
+const createForm = document.getElementById('createForm');
+const createTarget = document.getElementById('createTarget');
+const createType = document.getElementById('createType');
+const createSeq = document.getElementById('createSeq');
+const createText = document.getElementById('createText');
+const createModalError = document.getElementById('createModalError');
+const createConfirmBtn = document.getElementById('createConfirmBtn');
+const createCancelBtn = document.getElementById('createCancelBtn');
+let createState = null; // { olpnId, targets, busy }
+
+function showCreateError(msg) {
+  createModalError.textContent = msg;
+  createModalError.style.display = 'block';
+}
+
+async function openCreateModal(olpnId) {
+  createState = { olpnId, targets: [], busy: false };
+  createOlpnIdEl.textContent = olpnId;
+  createModalError.style.display = 'none';
+  createLoading.style.display = 'block';
+  createForm.style.display = 'none';
+  createConfirmBtn.disabled = true;
+  createConfirmBtn.innerHTML = '<i class="fas fa-plus"></i> Create';
+  createCancelBtn.disabled = false;
+  createText.value = '';
+  createType.value = 'Pick';
+  createModal.style.display = 'flex';
+
+  try {
+    const res = await apiCall('olpn_targets', { org: currentOrg, olpnId });
+    if (!createState || createState.olpnId !== olpnId) return; // closed meanwhile
+    createLoading.style.display = 'none';
+    if (!res.success) {
+      if (res.tokenInvalid) { closeCreateModal(true); handleTokenInvalid(); return; }
+      showCreateError(res.error || 'Could not load oLPN details');
+      return;
+    }
+    createState.targets = res.targets;
+    createTarget.innerHTML = res.targets.map((t, i) =>
+      `<option value="${i}">${escapeHtml(t.label)}${t.existingCount ? ` (${t.existingCount} existing)` : ''}</option>`
+    ).join('');
+    // Default to the first detail when there's exactly one — the common case.
+    const details = res.targets.filter((t) => t.type === 'OlpnDetail');
+    createTarget.value = details.length === 1 ? String(res.targets.indexOf(details[0])) : '0';
+    syncCreateSequence();
+    createForm.style.display = 'block';
+    createConfirmBtn.disabled = false;
+    createText.focus();
+  } catch (error) {
+    createLoading.style.display = 'none';
+    showCreateError(error.message || 'Could not load oLPN details');
+  }
+}
+
+function syncCreateSequence() {
+  const t = createState && createState.targets[Number(createTarget.value)];
+  if (t) createSeq.value = t.nextSequence;
+}
+
+function closeCreateModal(force) {
+  if (!force && createState && createState.busy) return; // create in flight
+  createModal.style.display = 'none';
+  createState = null;
+}
+
+async function confirmCreate() {
+  if (!createState || createState.busy) return;
+  const t = createState.targets[Number(createTarget.value)];
+  const text = createText.value.trim();
+  const seq = Number(createSeq.value);
+  if (!t) { showCreateError('Choose where to attach the instruction.'); return; }
+  if (!text) { showCreateError('Instruction text cannot be empty.'); createText.focus(); return; }
+  if (!Number.isInteger(seq) || seq < 1) { showCreateError('Sequence must be a whole number of 1 or more.'); return; }
+
+  createModalError.style.display = 'none';
+  createState.busy = true;
+  createConfirmBtn.disabled = createCancelBtn.disabled = true;
+  createConfirmBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Creating...';
+  const olpnId = createState.olpnId;
+  try {
+    const res = await apiCall('create_instruction', {
+      org: currentOrg,
+      olpnId,
+      targetType: t.type,
+      olpnDetailId: t.olpnDetailId,
+      instructionType: createType.value,
+      instructionText: text,
+      sequence: seq
+    });
+    if (!res.success) {
+      if (res.tokenInvalid) { closeCreateModal(true); handleTokenInvalid(); return; }
+      createState.busy = false;
+      createConfirmBtn.disabled = createCancelBtn.disabled = false;
+      createConfirmBtn.innerHTML = '<i class="fas fa-plus"></i> Create';
+      showCreateError(res.error || 'Create failed');
+      return;
+    }
+    closeCreateModal(true);
+    // Re-run the search so the new row arrives fully joined (order, task...).
+    if (lastSearchValue) await runSearch(lastSearchValue);
+    if (res.visibleOnOlpn) {
+      showStatus(`Instruction created on oLPN ${olpnId} / ${res.target}: "${res.instructionText}"`, 'success');
+    } else {
+      showStatus(`Instruction "${res.instructionText}" was created (PK ${res.pk}), but oLPN ${olpnId} doesn't list it yet, so it may not appear in search results.`, 'warn');
+    }
+  } catch (error) {
+    console.error('Create error:', error);
+    if (createState) {
+      createState.busy = false;
+      createConfirmBtn.disabled = createCancelBtn.disabled = false;
+      createConfirmBtn.innerHTML = '<i class="fas fa-plus"></i> Create';
+    }
+    showCreateError(error.message || 'Create failed');
+  }
+}
+
+createTarget.addEventListener('change', syncCreateSequence);
+createConfirmBtn.addEventListener('click', confirmCreate);
+createCancelBtn.addEventListener('click', () => closeCreateModal());
+createModal.addEventListener('click', (e) => { if (e.target === createModal) closeCreateModal(); });
+createText.addEventListener('keydown', (e) => { if (e.key === 'Enter') confirmCreate(); });
 
 // Instruction cell: text + pencil icon; clicking the pencil swaps in an
 // inline editor that saves only InstructionText (by PK) via the backend.
@@ -287,7 +430,9 @@ deleteConfirmBtn.addEventListener('click', confirmDelete);
 deleteCancelBtn.addEventListener('click', closeDeleteModal);
 deleteModal.addEventListener('click', (e) => { if (e.target === deleteModal) closeDeleteModal(); });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && deleteModal.style.display === 'flex') closeDeleteModal();
+  if (e.key !== 'Escape') return;
+  if (deleteModal.style.display === 'flex') closeDeleteModal();
+  if (createModal.style.display === 'flex') closeCreateModal();
 });
 
 function openInstructionEditor(cell) {
@@ -352,6 +497,7 @@ function openInstructionEditor(cell) {
 }
 
 async function runSearch(value) {
+  lastSearchValue = value;
   hideStatus();
   resultsEl.style.display = 'none';
   if (!value) {
