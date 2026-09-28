@@ -35,7 +35,7 @@ const USERNAME_BASE = process.env.MANHATTAN_USERNAME_BASE || 'sdtadmin@';
 const USAGE_INGEST_URL = (process.env.MANHATTAN_USAGE_INGEST_URL || '').trim();
 const USAGE_INGEST_SECRET = (process.env.MANHATTAN_USAGE_INGEST_SECRET || '').trim();
 const APP_NAME = 'findinstructions-app';
-const APP_VERSION = '1.5.0';
+const APP_VERSION = '1.6.0';
 
 async function forwardUsageEvent(payload) {
   if (!USAGE_INGEST_URL) {
@@ -68,6 +68,7 @@ const ASSIGNED_INSTRUCTION_BASE_PATH = '/pickpack/api/fw-aux-svcs/assignedInstru
 // Add-instruction modal.
 const ASSIGNED_INSTRUCTION_SAVE_PATH = '/pickpack/api/fw-aux-svcs/assignedInstruction/save';
 const INSTRUCTION_TYPES = ['Pick', 'Pack'];
+const INSTRUCTION_CATALOG_SEARCH_PATH = '/aux-svcs/api/aux-svcs/instruction/search';
 const ASSIGNED_INSTRUCTION_ENTITY_FIELDS = [
   'OrgId', 'FacilityId', 'InstructionId', 'InstructionText', 'InstructionType',
   'Sequence', 'InstructionRequestorTypeId', 'InstructionRequestorId', 'PK'
@@ -685,7 +686,31 @@ async function getOlpnTargets({ org, olpnId }, token) {
   };
 }
 
-async function createInstruction({ org, olpnId, targetType, olpnDetailId, instructionType, instructionText, sequence }, token) {
+// Master instruction definitions (InstructionId + default InstructionText)
+// used to populate the create modal's dropdown. Query/template supplied by
+// the user from Postman against SS-DEMO (2026-09-28): 77 rows.
+async function getInstructionCatalog(orgUpper, token) {
+  const resp = await mawmPost(INSTRUCTION_CATALOG_SEARCH_PATH, token, orgUpper, {
+    Query: 'InstructionId != null',
+    Template: { InstructionId: null, InstructionText: null },
+    Size: 1000
+  });
+  if (!resp.httpOk || resp.parseError || resp.success === false) {
+    return { error: `Could not load instruction list ${describeMawmFailure(resp)}` };
+  }
+  const seen = new Set();
+  const instructions = [];
+  for (const r of dataRows(resp)) {
+    const id = r.InstructionId != null ? String(r.InstructionId) : '';
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    instructions.push({ id, text: r.InstructionText != null ? String(r.InstructionText) : '' });
+  }
+  instructions.sort((a, b) => a.id.localeCompare(b.id, undefined, { sensitivity: 'base' }));
+  return { instructions };
+}
+
+async function createInstruction({ org, olpnId, targetType, olpnDetailId, instructionType, instructionId, instructionText, sequence }, token) {
   const orgUpper = org.toUpperCase();
 
   // 1. Resolve the requestor ID server-side — never trust one from the browser.
@@ -696,12 +721,16 @@ async function createInstruction({ org, olpnId, targetType, olpnDetailId, instru
   );
   if (!target) return { success: false, error: `oLPN ${olpnId} has no ${targetType === 'Olpn' ? 'header' : `detail ${olpnDetailId}`} target.` };
 
-  // InstructionId = the text, matching existing records (e.g. "Wrap in
-  // plastic"). It must be unique per requestor, so reject a duplicate here
-  // with a clear message rather than relying on MAWM's duplicate-key error.
-  const instructionId = instructionText;
+  // InstructionId must be a real master instruction, and unique per
+  // requestor — reject both here with a clear message rather than relying
+  // on MAWM's own error.
+  const catalog = await getInstructionCatalog(orgUpper, token);
+  if (catalog.error) return { success: false, error: catalog.error };
+  if (!catalog.instructions.some((i) => i.id === instructionId)) {
+    return { success: false, error: `"${instructionId}" is not a defined instruction.` };
+  }
   if (target.existing.some((a) => a.InstructionId === instructionId)) {
-    return { success: false, error: `${target.label} already has an instruction "${instructionText}".` };
+    return { success: false, error: `${target.label} already has instruction "${instructionId}".` };
   }
 
   // 2. Create. No PK — MAWM generates it; OrgId/FacilityId come from headers.
@@ -858,12 +887,25 @@ async function handler(req, res) {
     }
   }
 
+  if (action === 'instruction_catalog') {
+    const org = req.body.org;
+    if (!org || !String(org).trim()) return res.status(400).json({ success: false, error: 'ORG required' });
+    try {
+      const r = await getInstructionCatalog(String(org).toUpperCase(), token);
+      return res.json(r.error ? { success: false, error: r.error } : { success: true, instructions: r.instructions });
+    } catch (e) {
+      console.error('[instruction_catalog] error:', e);
+      return res.json({ success: false, error: e.message || 'Lookup failed', tokenInvalid: !!e.tokenInvalid });
+    }
+  }
+
   if (action === 'create_instruction') {
     const org = req.body.org;
     const olpnId = req.body.olpnId != null ? String(req.body.olpnId).trim() : '';
     const targetType = req.body.targetType;
     const olpnDetailId = req.body.olpnDetailId != null ? String(req.body.olpnDetailId).trim() : '';
     const instructionType = req.body.instructionType;
+    const instructionId = req.body.instructionId != null ? String(req.body.instructionId) : '';
     const instructionText = req.body.instructionText != null ? String(req.body.instructionText).trim() : '';
     const sequence = Number(req.body.sequence);
 
@@ -878,6 +920,7 @@ async function handler(req, res) {
     if (!INSTRUCTION_TYPES.includes(instructionType)) {
       return res.status(400).json({ success: false, error: `instructionType must be one of ${INSTRUCTION_TYPES.join(', ')}` });
     }
+    if (!instructionId) return res.status(400).json({ success: false, error: 'Select an Instruction ID' });
     if (!instructionText) return res.status(400).json({ success: false, error: 'Instruction text cannot be empty' });
     if (!Number.isInteger(sequence) || sequence < 1) {
       return res.status(400).json({ success: false, error: 'Sequence must be a whole number of 1 or more' });
@@ -885,7 +928,7 @@ async function handler(req, res) {
 
     try {
       const result = await createInstruction(
-        { org, olpnId, targetType, olpnDetailId, instructionType, instructionText, sequence },
+        { org, olpnId, targetType, olpnDetailId, instructionType, instructionId, instructionText, sequence },
         token
       );
       await forwardUsageEvent({

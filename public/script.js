@@ -218,6 +218,7 @@ const createTarget = document.getElementById('createTarget');
 const createType = document.getElementById('createType');
 const createSeq = document.getElementById('createSeq');
 const createText = document.getElementById('createText');
+const createInstructionId = document.getElementById('createInstructionId');
 const createModalError = document.getElementById('createModalError');
 const createConfirmBtn = document.getElementById('createConfirmBtn');
 const createCancelBtn = document.getElementById('createCancelBtn');
@@ -239,17 +240,25 @@ async function openCreateModal(olpnId) {
   createCancelBtn.disabled = false;
   createText.value = '';
   createType.value = 'Pick';
+  createInstructionId.innerHTML = '';
   createModal.style.display = 'flex';
 
   try {
-    const res = await apiCall('olpn_targets', { org: currentOrg, olpnId });
+    const [res, catalog] = await Promise.all([
+      apiCall('olpn_targets', { org: currentOrg, olpnId }),
+      loadInstructionCatalog()
+    ]);
     if (!createState || createState.olpnId !== olpnId) return; // closed meanwhile
     createLoading.style.display = 'none';
-    if (!res.success) {
-      if (res.tokenInvalid) { closeCreateModal(true); handleTokenInvalid(); return; }
-      showCreateError(res.error || 'Could not load oLPN details');
+    if (!res.success || !catalog.success) {
+      if (res.tokenInvalid || catalog.tokenInvalid) { closeCreateModal(true); handleTokenInvalid(); return; }
+      showCreateError((!res.success ? res.error : catalog.error) || 'Could not load oLPN details');
       return;
     }
+    createInstructionId.innerHTML =
+      '<option value="">— Select an instruction —</option>' +
+      catalog.instructions.map((ins) => `<option value="${escapeHtml(ins.id).replace(/"/g, '&quot;')}">${escapeHtml(ins.id)}</option>`).join('');
+    createInstructionId.value = '';
     createState.targets = res.targets;
     createTarget.innerHTML = res.targets.map((t, i) =>
       `<option value="${i}">${escapeHtml(t.label)}${t.existingCount ? ` (${t.existingCount} existing)` : ''}</option>`
@@ -260,11 +269,27 @@ async function openCreateModal(olpnId) {
     syncCreateSequence();
     createForm.style.display = 'block';
     createConfirmBtn.disabled = false;
-    createText.focus();
+    createInstructionId.focus();
   } catch (error) {
     createLoading.style.display = 'none';
     showCreateError(error.message || 'Could not load oLPN details');
   }
+}
+
+// Master instruction list, loaded once per page (it rarely changes).
+let instructionCatalog = null;
+async function loadInstructionCatalog() {
+  if (instructionCatalog) return { success: true, instructions: instructionCatalog };
+  const res = await apiCall('instruction_catalog', { org: currentOrg });
+  if (res.success) instructionCatalog = res.instructions;
+  return res;
+}
+
+// Picking an Instruction ID fills in its default text; the user can still
+// edit the text afterwards.
+function syncCreateText() {
+  const ins = (instructionCatalog || []).find((i) => i.id === createInstructionId.value);
+  createText.value = ins ? ins.text : '';
 }
 
 function syncCreateSequence() {
@@ -281,9 +306,11 @@ function closeCreateModal(force) {
 async function confirmCreate() {
   if (!createState || createState.busy) return;
   const t = createState.targets[Number(createTarget.value)];
+  const instructionId = createInstructionId.value;
   const text = createText.value.trim();
   const seq = Number(createSeq.value);
   if (!t) { showCreateError('Choose where to attach the instruction.'); return; }
+  if (!instructionId) { showCreateError('Select an Instruction ID.'); createInstructionId.focus(); return; }
   if (!text) { showCreateError('Instruction text cannot be empty.'); createText.focus(); return; }
   if (!Number.isInteger(seq) || seq < 1) { showCreateError('Sequence must be a whole number of 1 or more.'); return; }
 
@@ -299,6 +326,7 @@ async function confirmCreate() {
       targetType: t.type,
       olpnDetailId: t.olpnDetailId,
       instructionType: createType.value,
+      instructionId,
       instructionText: text,
       sequence: seq
     });
@@ -330,6 +358,7 @@ async function confirmCreate() {
 }
 
 createTarget.addEventListener('change', syncCreateSequence);
+createInstructionId.addEventListener('change', syncCreateText);
 createConfirmBtn.addEventListener('click', confirmCreate);
 createCancelBtn.addEventListener('click', () => closeCreateModal());
 createModal.addEventListener('click', (e) => { if (e.target === createModal) closeCreateModal(); });

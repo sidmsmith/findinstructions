@@ -136,7 +136,13 @@ oLPN found — including oLPNs with no instructions yet. It opens a modal:
   existing instructions on each).
 - **Type** — Pick or Pack.
 - **Sequence** — pre-filled with the next free number for that target.
-- **Instruction text**.
+- **Instruction ID** — required dropdown (starts blank) of the master
+  instruction definitions, loaded from
+  `POST /aux-svcs/api/aux-svcs/instruction/search`
+  (`Query: "InstructionId != null"`, template `InstructionId` +
+  `InstructionText`, `Size: 1000`; 77 in SS-DEMO). Loaded once per page.
+- **Instruction text** — starts blank; picking an Instruction ID fills in
+  that instruction's default text, which the user can then edit.
 
 How the target is resolved: every oLPN and oLPN detail has an
 *instruction requestor ID* from the moment it exists, whether or not it
@@ -150,14 +156,17 @@ browser.
 
 The backend (`create_instruction`):
 
-1. Re-reads the oLPN, resolves the chosen target's requestor ID, and
-   rejects a duplicate `InstructionId` on that target.
+1. Re-reads the oLPN and resolves the chosen target's requestor ID;
+   re-loads the instruction list and rejects an `InstructionId` that isn't
+   defined there, or that the target already has (it must be unique per
+   requestor).
 2. `POST /pickpack/api/fw-aux-svcs/assignedInstruction/save` with
    `InstructionRequestorId`, `InstructionRequestorTypeId` (`Olpn` or
    `OlpnDetail`), `InstructionType`, `InstructionId`, `InstructionText`,
    `Sequence` — **no `PK`** (MAWM generates it) and no `OrgId`/`FacilityId`
-   (taken from the headers). `InstructionId` is set to the instruction
-   text, matching existing records.
+   (taken from the headers). `InstructionId` is the selected master
+   instruction; `InstructionText` is whatever the user left in the text
+   box.
 3. Finds the new record via `assignedInstruction/search`.
 4. Re-reads the oLPN and checks the new instruction appears under the
    **intended** target. If it shows up elsewhere, it reports an error with
