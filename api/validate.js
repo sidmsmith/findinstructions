@@ -35,7 +35,7 @@ const USERNAME_BASE = process.env.MANHATTAN_USERNAME_BASE || 'sdtadmin@';
 const USAGE_INGEST_URL = (process.env.MANHATTAN_USAGE_INGEST_URL || '').trim();
 const USAGE_INGEST_SECRET = (process.env.MANHATTAN_USAGE_INGEST_SECRET || '').trim();
 const APP_NAME = 'findinstructions-app';
-const APP_VERSION = '1.6.0';
+const APP_VERSION = '1.7.0';
 
 async function forwardUsageEvent(payload) {
   if (!USAGE_INGEST_URL) {
@@ -396,20 +396,31 @@ async function findInstructions({ org, mode, value }, token) {
 
   // 5. Flatten: join each assignedInstruction row back to its oLPN (detail)
   //    context and, where available, the task detail that produced it.
+  // A header-level (Olpn) instruction belongs to the whole oLPN, not to any
+  // one line — so it gets no order line, item, or task detail. Order and
+  // task are shown only when every task detail on that oLPN agrees on them.
+  function sharedValue(rows, field) {
+    const values = new Set(rows.map((r) => r[field]).filter((v) => v != null && v !== ''));
+    return values.size === 1 ? [...values][0] : null;
+  }
+
   const flattened = instructionRows.map((inst) => {
     const ctx = requestorMap.get(String(inst.InstructionRequestorId)) || {};
-    const matchingTaskDetail = taskDetails.find(
-      (td) =>
-        td.OlpnId === ctx.olpnId &&
-        (ctx.olpnDetailId == null || td.OlpnDetailId === ctx.olpnDetailId)
-    );
+    const isHeader = ctx.type === 'Olpn';
+    const olpnTaskDetails = taskDetails.filter((td) => td.OlpnId === ctx.olpnId);
+    const matchingTaskDetail = isHeader
+      ? null
+      : olpnTaskDetails.find((td) => ctx.olpnDetailId == null || td.OlpnDetailId === ctx.olpnDetailId);
 
     return {
       OrgId: inst.OrgId || orgUpper,
       FacilityId: inst.FacilityId || facilityId,
-      OrderId: (matchingTaskDetail && matchingTaskDetail.OrderId) || null,
+      IsHeader: isHeader,
+      OrderId: isHeader
+        ? sharedValue(olpnTaskDetails, 'OrderId')
+        : (matchingTaskDetail && matchingTaskDetail.OrderId) || null,
       OrderLineId: (matchingTaskDetail && matchingTaskDetail.OrderLineId) || null,
-      ItemId: (matchingTaskDetail && matchingTaskDetail.ItemId) || ctx.itemId || null,
+      ItemId: isHeader ? null : (matchingTaskDetail && matchingTaskDetail.ItemId) || ctx.itemId || null,
       OlpnId: ctx.olpnId || null,
       OlpnStatus: ctx.olpnId ? olpnStatusById.get(ctx.olpnId) : null,
       OlpnDetailId: ctx.olpnDetailId,
@@ -423,14 +434,18 @@ async function findInstructions({ org, mode, value }, token) {
       PK: inst.PK,
       CreatedTimestamp: inst.CreatedTimestamp,
       UpdatedTimestamp: inst.UpdatedTimestamp,
-      TaskId: matchingTaskDetail ? matchingTaskDetail.TaskId : null,
+      TaskId: isHeader
+        ? sharedValue(olpnTaskDetails, 'TaskId')
+        : matchingTaskDetail ? matchingTaskDetail.TaskId : null,
       TaskDetailId: matchingTaskDetail ? matchingTaskDetail.TaskDetailId : null,
       TaskDetailStatus: matchingTaskDetail ? matchingTaskDetail.Status : null
     };
   });
 
+  // Per oLPN: header instructions first, then details; each by Sequence.
   flattened.sort((a, b) => {
     if (a.OlpnId !== b.OlpnId) return String(a.OlpnId).localeCompare(String(b.OlpnId));
+    if (a.IsHeader !== b.IsHeader) return a.IsHeader ? -1 : 1;
     return (Number(a.Sequence) || 0) - (Number(b.Sequence) || 0);
   });
 

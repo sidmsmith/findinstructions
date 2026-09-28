@@ -144,16 +144,18 @@ function renderResults(res) {
   } else {
     for (const row of res.instructions) {
       const tr = document.createElement('tr');
+      // Header-level instructions apply to the whole oLPN, not one line.
+      const headerLabel = '<span class="header-label">Header</span>';
       tr.innerHTML = [
         row.Sequence,
         escapeHtml(row.InstructionType),
         '', // Instruction cell — filled by renderInstructionCell below
         escapeHtml(row.OrderId),
-        escapeHtml(row.OrderLineId),
+        row.IsHeader ? headerLabel : escapeHtml(row.OrderLineId),
         escapeHtml(row.ItemId),
         escapeHtml(row.OlpnId),
         escapeHtml(row.OlpnStatus),
-        escapeHtml(row.OlpnDetailId),
+        row.IsHeader ? headerLabel : escapeHtml(row.OlpnDetailId),
         escapeHtml(row.TaskId),
         escapeHtml(row.TaskDetailId),
         escapeHtml(row.TaskDetailStatus),
@@ -268,7 +270,7 @@ async function openCreateModal(olpnId) {
     createTarget.value = details.length === 1 ? String(res.targets.indexOf(details[0])) : '0';
     syncCreateSequence();
     createForm.style.display = 'block';
-    createConfirmBtn.disabled = false;
+    syncCreateButton(); // stays disabled until an Instruction ID is chosen
     createInstructionId.focus();
   } catch (error) {
     createLoading.style.display = 'none';
@@ -290,6 +292,13 @@ async function loadInstructionCatalog() {
 function syncCreateText() {
   const ins = (instructionCatalog || []).find((i) => i.id === createInstructionId.value);
   createText.value = ins ? ins.text : '';
+  syncCreateButton();
+}
+
+// Create is only enabled once a valid (listed) Instruction ID is selected.
+function syncCreateButton() {
+  const valid = (instructionCatalog || []).some((i) => i.id === createInstructionId.value);
+  createConfirmBtn.disabled = !valid || !!(createState && createState.busy);
 }
 
 function syncCreateSequence() {
@@ -333,7 +342,8 @@ async function confirmCreate() {
     if (!res.success) {
       if (res.tokenInvalid) { closeCreateModal(true); handleTokenInvalid(); return; }
       createState.busy = false;
-      createConfirmBtn.disabled = createCancelBtn.disabled = false;
+      createCancelBtn.disabled = false;
+      syncCreateButton();
       createConfirmBtn.innerHTML = '<i class="fas fa-plus"></i> Create';
       showCreateError(res.error || 'Create failed');
       return;
@@ -350,7 +360,8 @@ async function confirmCreate() {
     console.error('Create error:', error);
     if (createState) {
       createState.busy = false;
-      createConfirmBtn.disabled = createCancelBtn.disabled = false;
+      createCancelBtn.disabled = false;
+      syncCreateButton();
       createConfirmBtn.innerHTML = '<i class="fas fa-plus"></i> Create';
     }
     showCreateError(error.message || 'Create failed');
@@ -362,7 +373,7 @@ createInstructionId.addEventListener('change', syncCreateText);
 createConfirmBtn.addEventListener('click', confirmCreate);
 createCancelBtn.addEventListener('click', () => closeCreateModal());
 createModal.addEventListener('click', (e) => { if (e.target === createModal) closeCreateModal(); });
-createText.addEventListener('keydown', (e) => { if (e.key === 'Enter') confirmCreate(); });
+createText.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !createConfirmBtn.disabled) confirmCreate(); });
 
 // Instruction cell: text + pencil icon; clicking the pencil swaps in an
 // inline editor that saves only InstructionText (by PK) via the backend.

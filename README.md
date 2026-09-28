@@ -76,6 +76,11 @@ Since these tokens expire every few hours, drop a fresh one into `.token`
    request per ID if the environment rejects it).
 4. Everything is joined back together on `InstructionRequestorId` (→ oLPN /
    oLPN detail) and `OlpnId`/`OlpnDetailId` (→ task detail → order line).
+   **Header-level** (`Olpn`) instructions belong to the whole oLPN, so they
+   get no order line, item, oLPN detail, or task detail (the table shows
+   *Header* in the Order Line and oLPN Detail columns). Their Order and
+   Task are shown only when every task detail on that oLPN has the same
+   one. Header instructions sort before the oLPN's detail instructions.
 
 Unmatched records (an oLPN that couldn't be found, an oLPN detail with a
 requestor ID but no runtime instruction row, a task detail whose oLPN
@@ -136,7 +141,8 @@ oLPN found — including oLPNs with no instructions yet. It opens a modal:
   existing instructions on each).
 - **Type** — Pick or Pack.
 - **Sequence** — pre-filled with the next free number for that target.
-- **Instruction ID** — required dropdown (starts blank) of the master
+- **Instruction ID** — required dropdown (starts blank; **Create** stays
+  greyed out until a listed ID is selected) of the master
   instruction definitions, loaded from
   `POST /aux-svcs/api/aux-svcs/instruction/search`
   (`Query: "InstructionId != null"`, template `InstructionId` +
@@ -174,8 +180,11 @@ The backend (`create_instruction`):
    yet, it reports a warning (it won't appear in search results).
 5. The UI then re-runs the search so the new row appears fully joined.
 
-Evidence: endpoint and payload from a Glean conversation (2026-09-28);
-first exercised through this modal.
+Evidence: endpoint and payload from a Glean conversation; confirmed
+working through this modal against SS-DEMO oLPN `0000099999100015677`
+(2026-09-28) — a header instruction ("Cut Paper") landed on the header and
+a detail instruction ("BOGO Sticker") on detail 1, confirming the header
+ID comes first in `OlpnAndDetailsServiceRequestorIds`.
 
 ### Update and delete
 
