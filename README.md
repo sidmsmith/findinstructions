@@ -16,7 +16,25 @@ npm start               # or: npm run dev (vercel dev)
 ```
 
 Open http://localhost:3000, enter an ORG (e.g. `SS-DEMO`), authenticate,
-then search by Order ID or oLPN ID.
+then enter an Order ID or oLPN ID in the single search box.
+
+## One search box: Order first, then oLPN
+
+There is no Order/oLPN toggle. The value is searched as an **Order**
+first; if no order matches, the same value is searched as an **oLPN**.
+A "Matched as" badge shows which one produced the results.
+
+- "Order found" means the Task search (`TaskDetail.OrderId=`) returned at
+  least one task detail. That Task search is the app's only order
+  lookup, so an order with no tasks at all falls through to the oLPN
+  search.
+- The oLPN fallback costs one extra Task search (the failed Order
+  attempt), whose raw response is kept under `orderAttempt` in the
+  diagnostics panel.
+- URL parameters `Id`, `Order`/`OrderId`, and `Olpn`/`OlpnId` all feed
+  the same search, so older links still work. The API still accepts an
+  explicit `mode: 'order' | 'olpn'` (no fallback); the UI always sends
+  `mode: 'auto'`.
 
 ## Silent auth via `.token`
 
@@ -37,8 +55,8 @@ Since these tokens expire every few hours, drop a fresh one into `.token`
 
 ## How the join works
 
-1. `POST /task/api/task/task/search` with a `TaskDetail.OrderId=` or
-   `TaskDetail.OlpnId=` dotted-path filter — returns Task rows with a nested
+1. `POST /task/api/task/task/search` with a `TaskDetail.OrderId=` (or, on
+   the oLPN fallback, `TaskDetail.OlpnId=`) dotted-path filter — returns Task rows with a nested
    `TaskDetail[]` array (`OrderId`, `OrderLineId`, `ItemId`, `OlpnId`,
    `OlpnDetailId`, `Status`).
 2. For every distinct `OlpnId`, `POST /pickpack/api/pickpack/olpn/search`

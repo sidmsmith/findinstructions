@@ -5,7 +5,6 @@ const orgInput = document.getElementById('org');
 const authSection = document.getElementById('authSection');
 const authStatusEl = document.getElementById('authStatus');
 const mainUI = document.getElementById('mainUI');
-const valueLabel = document.getElementById('valueLabel');
 const valueInput = document.getElementById('valueInput');
 const searchBtn = document.getElementById('searchBtn');
 const statusEl = document.getElementById('status');
@@ -43,16 +42,10 @@ async function apiCall(action, data = {}) {
 function parseUrlParams() {
   const params = new URLSearchParams(window.location.search);
   const urlOrg = params.get('Organization') || params.get('ORG') || params.get('org');
-  const urlOrder = params.get('Order') || params.get('OrderId');
-  const urlOlpn = params.get('Olpn') || params.get('OlpnId');
-
-  if (urlOlpn && urlOlpn.trim()) {
-    window.urlMode = 'olpn';
-    window.urlValue = urlOlpn.trim();
-  } else if (urlOrder && urlOrder.trim()) {
-    window.urlMode = 'order';
-    window.urlValue = urlOrder.trim();
-  }
+  // Order/Olpn (and their *Id forms) are kept for existing links; all of
+  // them now feed the same Order-first, then-oLPN search.
+  const urlValue = params.get('Id') || params.get('Order') || params.get('OrderId') || params.get('Olpn') || params.get('OlpnId');
+  if (urlValue && urlValue.trim()) window.urlValue = urlValue.trim();
   return urlOrg && urlOrg.trim() ? urlOrg.trim() : null;
 }
 
@@ -61,16 +54,11 @@ function enterMainUI() {
   authSection.style.display = 'none';
   mainUI.style.display = 'block';
 
-  if (window.urlMode && window.urlValue) {
-    if (window.urlMode === 'olpn') document.getElementById('modeOlpn').checked = true;
-    else document.getElementById('modeOrder').checked = true;
-    updateValueLabel();
-    valueInput.value = window.urlValue;
-    const mode = window.urlMode;
+  if (window.urlValue) {
     const value = window.urlValue;
-    window.urlMode = null;
+    valueInput.value = value;
     window.urlValue = null;
-    setTimeout(() => runSearch(mode, value), 300);
+    setTimeout(() => runSearch(value), 300);
   }
 }
 
@@ -125,17 +113,6 @@ async function authenticate() {
   }
 }
 
-function updateValueLabel() {
-  const mode = document.querySelector('input[name="mode"]:checked').value;
-  if (mode === 'order') {
-    valueLabel.textContent = 'Order ID:';
-    valueInput.placeholder = 'Enter an Order ID';
-  } else {
-    valueLabel.textContent = 'oLPN ID:';
-    valueInput.placeholder = 'Enter an oLPN ID';
-  }
-}
-
 function escapeHtml(s) {
   if (s == null) return '';
   return String(s)
@@ -150,7 +127,9 @@ function renderResults(res) {
   rawOutput.textContent = '';
 
   const c = res.counts || {};
+  const matchedAs = res.mode === 'order' ? 'Order' : 'oLPN';
   countsRow.innerHTML = [
+    `<span class="badge bg-info text-dark">Matched as: ${matchedAs}${res.fellBackToOlpn ? ' (no matching order)' : ''}</span>`,
     `<span class="badge bg-secondary">Task details: ${c.taskDetails ?? 0}</span>`,
     `<span class="badge bg-secondary">oLPNs checked: ${c.olpnsLooked ?? 0}</span>`,
     `<span class="badge bg-secondary">Requestor IDs: ${c.requestorIds ?? 0}</span>`,
@@ -372,7 +351,7 @@ function openInstructionEditor(cell) {
   });
 }
 
-async function runSearch(mode, value) {
+async function runSearch(value) {
   hideStatus();
   resultsEl.style.display = 'none';
   if (!value) {
@@ -383,7 +362,7 @@ async function runSearch(mode, value) {
   showStatus('Searching...', 'info');
   searchBtn.disabled = true;
   try {
-    const res = await apiCall('search', { org: currentOrg, mode, value });
+    const res = await apiCall('search', { org: currentOrg, mode: 'auto', value });
     if (!res.success) {
       if (res.tokenInvalid) {
         token = null;
@@ -398,7 +377,9 @@ async function runSearch(mode, value) {
     hideStatus();
     renderResults(res);
     if ((res.counts?.instructions ?? 0) === 0) {
-      showStatus('Search completed — no instructions found for this ' + (mode === 'order' ? 'order' : 'oLPN') + '.', 'warn');
+      showStatus(res.fellBackToOlpn
+        ? 'No matching order — searched as an oLPN, and no instructions were found.'
+        : 'Search completed — no instructions found for this order.', 'warn');
     }
   } catch (error) {
     console.error('Search error:', error);
@@ -412,16 +393,8 @@ orgInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') authenticate();
 });
 valueInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') {
-    const mode = document.querySelector('input[name="mode"]:checked').value;
-    runSearch(mode, valueInput.value.trim());
-  }
+  if (e.key === 'Enter') runSearch(valueInput.value.trim());
 });
-searchBtn.addEventListener('click', () => {
-  const mode = document.querySelector('input[name="mode"]:checked').value;
-  runSearch(mode, valueInput.value.trim());
-});
-document.getElementById('modeOrder').addEventListener('change', updateValueLabel);
-document.getElementById('modeOlpn').addEventListener('change', updateValueLabel);
+searchBtn.addEventListener('click', () => runSearch(valueInput.value.trim()));
 
 init();

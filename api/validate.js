@@ -35,7 +35,7 @@ const USERNAME_BASE = process.env.MANHATTAN_USERNAME_BASE || 'sdtadmin@';
 const USAGE_INGEST_URL = (process.env.MANHATTAN_USAGE_INGEST_URL || '').trim();
 const USAGE_INGEST_SECRET = (process.env.MANHATTAN_USAGE_INGEST_SECRET || '').trim();
 const APP_NAME = 'findinstructions-app';
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.4.0';
 
 async function forwardUsageEvent(payload) {
   if (!USAGE_INGEST_URL) {
@@ -467,6 +467,32 @@ async function findInstructions({ org, mode, value }, token) {
   };
 }
 
+// Single-box search: try the value as an Order first; only if no order
+// matches, search it as an oLPN. "Order found" means the Task search
+// returned at least one TaskDetail for that OrderId — the Task search is
+// this app's only order lookup, so an order with no tasks at all falls
+// through to the oLPN search. An explicit 'order'/'olpn' mode skips the
+// fallback.
+async function searchAuto({ org, mode, value }, token) {
+  if (mode !== 'auto') {
+    const result = await findInstructions({ org, mode, value }, token);
+    return { ...result, requestedMode: mode, fellBackToOlpn: false };
+  }
+
+  const orderResult = await findInstructions({ org, mode: 'order', value }, token);
+  if (orderResult.counts.taskDetails > 0) {
+    return { ...orderResult, requestedMode: 'auto', fellBackToOlpn: false };
+  }
+
+  const olpnResult = await findInstructions({ org, mode: 'olpn', value }, token);
+  return {
+    ...olpnResult,
+    requestedMode: 'auto',
+    fellBackToOlpn: true,
+    raw: { ...olpnResult.raw, orderAttempt: orderResult.raw }
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Update one assigned instruction's text
 // ---------------------------------------------------------------------------
@@ -635,23 +661,24 @@ async function handler(req, res) {
 
   if (action === 'search') {
     const org = req.body.org;
-    const mode = req.body.mode; // 'order' | 'olpn'
+    const mode = req.body.mode || 'auto'; // 'auto' | 'order' | 'olpn'
     const value = req.body.value;
 
     if (!org || !String(org).trim()) return res.status(400).json({ success: false, error: 'ORG required' });
-    if (mode !== 'order' && mode !== 'olpn') {
-      return res.status(400).json({ success: false, error: "mode must be 'order' or 'olpn'" });
+    if (mode !== 'auto' && mode !== 'order' && mode !== 'olpn') {
+      return res.status(400).json({ success: false, error: "mode must be 'auto', 'order' or 'olpn'" });
     }
     if (!value || !String(value).trim()) {
       return res.status(400).json({ success: false, error: 'A value to search for is required' });
     }
 
     try {
-      const result = await findInstructions({ org, mode, value: String(value).trim() }, token);
+      const result = await searchAuto({ org, mode, value: String(value).trim() }, token);
       await forwardUsageEvent({
         event_name: 'search_completed',
         org: String(org).toUpperCase(),
-        mode,
+        mode: result.mode, // the mode that actually produced the results
+        requestedMode: mode,
         instructionsFound: result.counts ? result.counts.instructions : undefined
       });
       return res.json(result);
