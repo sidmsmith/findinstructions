@@ -402,10 +402,19 @@ function syncCreateButton() {
   createConfirmBtn.disabled = !valid || !!(createState && createState.busy);
 }
 
-// Sequences are numbered within target + type, so the suggestion depends on both.
+// Sequences are numbered within target + type. With n existing, the new
+// instruction can go at position 1..n+1 (default: last); the ones at and
+// after that position move down by one.
 function syncCreateSequence() {
   const t = createState && createState.targets[Number(createTarget.value)];
-  if (t && t.nextSequenceByType) createSeq.value = t.nextSequenceByType[createType.value] || 1;
+  const n = (t && t.countByType && t.countByType[createType.value]) || 0;
+  const opts = [];
+  for (let i = 1; i <= n + 1; i++) {
+    const note = n === 0 ? '' : i === 1 ? ' (first)' : i === n + 1 ? ' (last)' : '';
+    opts.push(`<option value="${i}">${i}${note}</option>`);
+  }
+  createSeq.innerHTML = opts.join('');
+  createSeq.value = String(n + 1);
 }
 
 function closeCreateModal(force) {
@@ -453,7 +462,9 @@ async function confirmCreate() {
     closeCreateModal(true);
     // Re-run the search so the new row arrives fully joined (order, task...).
     if (lastSearchValue) await runSearch(lastSearchValue);
-    if (res.visibleOnOlpn) {
+    if (res.renumberWarning) {
+      showStatus(res.renumberWarning, 'warn');
+    } else if (res.visibleOnOlpn) {
       showStatus(`Instruction created on oLPN ${olpnId} / ${res.target}: "${res.instructionText}"`, 'success');
     } else {
       showStatus(`Instruction "${res.instructionText}" was created (PK ${res.pk}), but oLPN ${olpnId} doesn't list it yet, so it may not appear in search results.`, 'warn');

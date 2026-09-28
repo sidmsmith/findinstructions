@@ -146,8 +146,10 @@ oLPN found — including oLPNs with no instructions yet. It opens a modal:
 - **Attach to** — "oLPN header" or "Detail N – Item X" (with a count of
   existing instructions on each).
 - **Type** — Pick or Pack.
-- **Sequence** — pre-filled with the next free number for that target
-  **and type** (sequences are numbered per target + Pick/Pack).
+- **Sequence** — a dropdown limited to **1…n+1**, where n is the number
+  of existing instructions on that target **of that type** (sequences are
+  numbered per target + Pick/Pack); defaults to last. The server enforces
+  the same range.
 - **Instruction ID** — required dropdown (starts blank; **Create** stays
   greyed out until a listed ID is selected) of the master
   instruction definitions, loaded from
@@ -185,7 +187,12 @@ The backend (`create_instruction`):
    **intended** target. If it shows up elsewhere, it reports an error with
    the new PK so it can be deleted; if the oLPN doesn't list it at all
    yet, it reports a warning (it won't appear in search results).
-5. The UI then re-runs the search so the new row appears fully joined.
+5. Inserts the new instruction at the chosen position and renumbers the
+   group 1…n+1 (only changed rows are written, via the same update-by-PK
+   call as reorder) — choosing 2 when there are 3 moves the old 2 and 3 to
+   3 and 4, rather than leaving two 2s. Existing gaps (e.g. 1, 2, 3, 9)
+   are closed up at the same time.
+6. The UI then re-runs the search so the new row appears fully joined.
 
 Evidence: endpoint and payload from a Glean conversation; confirmed
 working through this modal against SS-DEMO oLPN `0000099999100015677`

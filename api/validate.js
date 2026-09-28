@@ -35,7 +35,7 @@ const USERNAME_BASE = process.env.MANHATTAN_USERNAME_BASE || 'sdtadmin@';
 const USAGE_INGEST_URL = (process.env.MANHATTAN_USAGE_INGEST_URL || '').trim();
 const USAGE_INGEST_SECRET = (process.env.MANHATTAN_USAGE_INGEST_SECRET || '').trim();
 const APP_NAME = 'findinstructions-app';
-const APP_VERSION = '1.8.0';
+const APP_VERSION = '1.9.0';
 
 async function forwardUsageEvent(payload) {
   if (!USAGE_INGEST_URL) {
@@ -710,12 +710,11 @@ async function getOlpnTargets({ org, olpnId }, token) {
       itemId: t.itemId,
       label: t.label,
       existingCount: t.existing.length,
-      // Sequences are numbered within target + InstructionType.
-      nextSequenceByType: Object.fromEntries(INSTRUCTION_TYPES.map((type) => [
+      // Sequences are numbered within target + InstructionType; a new one
+      // can go at any position 1..count+1.
+      countByType: Object.fromEntries(INSTRUCTION_TYPES.map((type) => [
         type,
-        t.existing
-          .filter((a) => a.InstructionType === type)
-          .reduce((m, a) => Math.max(m, Number(a.Sequence) || 0), 0) + 1
+        t.existing.filter((a) => a.InstructionType === type).length
       ]))
     }))
   };
@@ -768,6 +767,16 @@ async function createInstruction({ org, olpnId, targetType, olpnDetailId, instru
     return { success: false, error: `${target.label} already has instruction "${instructionId}".` };
   }
 
+  // Sequence is a position within target + type: 1..count+1.
+  const groupBefore = target.existing.filter((a) => a.InstructionType === instructionType);
+  if (sequence > groupBefore.length + 1) {
+    return {
+      success: false,
+      error: `Sequence must be between 1 and ${groupBefore.length + 1} — ${target.label} has ` +
+        `${groupBefore.length} ${instructionType} instruction(s).`
+    };
+  }
+
   // 2. Create. No PK — MAWM generates it; OrgId/FacilityId come from headers.
   const payload = {
     InstructionRequestorId: target.requestorId,
@@ -812,19 +821,61 @@ async function createInstruction({ org, olpnId, targetType, olpnDetailId, instru
     };
   }
 
+  // 5. Insert at the chosen position and renumber the group 1..n+1, so
+  //    choosing 2 of 3 pushes the old 2 and 3 down to 3 and 4 instead of
+  //    leaving two 2s. Rows come from the fresh oLPN read.
+  let renumberWarning = null;
+  if (landedOn) {
+    const afterTarget = after.targets.find((t) => t.label === target.label);
+    const group = afterTarget.existing.filter((a) => a.InstructionType === instructionType);
+    const newRow = group.find((a) => String(a.PK) === pk);
+    const others = group
+      .filter((a) => String(a.PK) !== pk)
+      .sort((a, b) => (Number(a.Sequence) || 0) - (Number(b.Sequence) || 0) || String(a.PK).localeCompare(String(b.PK)));
+    others.splice(Math.min(sequence, others.length + 1) - 1, 0, newRow);
+    const renumbered = await renumberRows(orgUpper, others, token);
+    if (renumbered.error) {
+      renumberWarning = `Created, but renumbering the other ${instructionType} instructions failed: ${renumbered.error}`;
+    }
+  }
+
   return {
     success: true,
     pk,
     target: target.label,
     instructionText: created.InstructionText,
     // false => saved, but the oLPN doesn't list it yet, so a search won't show it
-    visibleOnOlpn: !!landedOn
+    visibleOnOlpn: !!landedOn,
+    renumberWarning
   };
 }
 
 // ---------------------------------------------------------------------------
 // Reorder one group of instructions (same oLPN, same target, same type)
 // ---------------------------------------------------------------------------
+
+// Gives `rowsInOrder` (full assignedInstruction entities, e.g. from an oLPN
+// read) Sequence 1..n, PUTting only rows whose Sequence changes — the same
+// confirmed update-by-PK call as the text edit, with only Sequence changed.
+async function renumberRows(orgUpper, rowsInOrder, token) {
+  const changes = rowsInOrder
+    .map((row, i) => ({ row, sequence: i + 1 }))
+    .filter((c) => Number(c.row.Sequence) !== c.sequence);
+  for (const [n, c] of changes.entries()) {
+    const payload = {};
+    for (const f of ASSIGNED_INSTRUCTION_ENTITY_FIELDS) payload[f] = c.row[f];
+    payload.Sequence = c.sequence;
+    const putPath = `${ASSIGNED_INSTRUCTION_BASE_PATH}/${encodeURIComponent(c.row.PK)}`;
+    const putResp = await mawmRequest('PUT', putPath, token, orgUpper, payload);
+    if (!putResp.httpOk || putResp.parseError || putResp.success === false) {
+      return {
+        error: `Updating the sequence of "${c.row.InstructionText}" failed ${describeMawmFailure(putResp)}`,
+        partial: n > 0
+      };
+    }
+  }
+  return { updatedCount: changes.length };
+}
 
 // `pks` is the group's full PK list in the desired order. Renumbers it
 // 1..n and PUTs only rows whose Sequence changes — via the same confirmed
@@ -855,24 +906,8 @@ async function resequenceInstructions({ org, olpnId, pks }, token) {
   if (bad) return { success: false, error: `Instruction ${bad.PK} belongs to ${bad.OrgId}/${bad.FacilityId}, not ${orgUpper}/${facilityId}.` };
 
   const byPk = new Map(group.map((a) => [String(a.PK), a]));
-  const changes = pks
-    .map((pk, i) => ({ row: byPk.get(pk), sequence: i + 1 }))
-    .filter((c) => Number(c.row.Sequence) !== c.sequence);
-
-  for (const c of changes) {
-    const payload = {};
-    for (const f of ASSIGNED_INSTRUCTION_ENTITY_FIELDS) payload[f] = c.row[f];
-    payload.Sequence = c.sequence;
-    const putPath = `${ASSIGNED_INSTRUCTION_BASE_PATH}/${encodeURIComponent(c.row.PK)}`;
-    const putResp = await mawmRequest('PUT', putPath, token, orgUpper, payload);
-    if (!putResp.httpOk || putResp.parseError || putResp.success === false) {
-      return {
-        success: false,
-        partial: changes.indexOf(c) > 0,
-        error: `Updating the sequence of "${c.row.InstructionText}" failed ${describeMawmFailure(putResp)}`
-      };
-    }
-  }
+  const renumbered = await renumberRows(orgUpper, pks.map((pk) => byPk.get(pk)), token);
+  if (renumbered.error) return { success: false, partial: renumbered.partial, error: renumbered.error };
 
   // Confirm the new order actually persisted.
   const after = await readOlpnWithRequestors(orgUpper, olpnId, token);
@@ -888,7 +923,7 @@ async function resequenceInstructions({ org, olpnId, pks }, token) {
     target: target.label,
     instructionType: first.InstructionType,
     sequences: pks.map((pk, i) => ({ pk, sequence: i + 1 })),
-    updatedCount: changes.length
+    updatedCount: renumbered.updatedCount
   };
 }
 
