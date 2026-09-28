@@ -3,9 +3,10 @@
 Enter a MAWM Order ID or oLPN ID and see every runtime `assignedInstruction`
 record linked to it (Pick and Pack), joined back to the Order Line, Task,
 oLPN, and oLPN Detail that produced it. From the results you can also
-**add** a new instruction to any oLPN (header or a specific detail), and
+**add** a new instruction to any oLPN (header or a specific detail),
 **edit** (pencil icon — instruction text only) or **delete** (trash icon,
-behind a confirmation) an existing one — see
+behind a confirmation) an existing one, and **reorder** (▲▼ arrows) the
+instructions within a group — see
 [Creating, updating and deleting instructions](#creating-updating-and-deleting-instructions).
 
 ## Setup
@@ -80,7 +81,11 @@ Since these tokens expire every few hours, drop a fresh one into `.token`
    get no order line, item, oLPN detail, or task detail (the table shows
    *Header* in the Order Line and oLPN Detail columns). Their Order and
    Task are shown only when every task detail on that oLPN has the same
-   one. Header instructions sort before the oLPN's detail instructions.
+   one.
+5. Rows are sorted per oLPN: header first, then details by number; within
+   a target Pick before Pack; then `Sequence`. So each **sequence group** —
+   same oLPN, same target (header or one detail), same `InstructionType` —
+   sits together, separated from the next group by a heavier line.
 
 Unmatched records (an oLPN that couldn't be found, an oLPN detail with a
 requestor ID but no runtime instruction row, a task detail whose oLPN
@@ -113,6 +118,7 @@ never resolved) are surfaced in the UI rather than silently dropped.
 If `MANHATTAN_USAGE_INGEST_URL` is set, the app forwards `app_opened`,
 `auth_success`/`auth_failed`, `search_completed`/`search_failed`,
 `instruction_created`/`instruction_create_failed`,
+`instructions_resequenced`/`instructions_resequence_failed`,
 `instruction_updated`/`instruction_update_failed`, and
 `instruction_deleted`/`instruction_delete_failed` events to the Manhattan
 App Usage Dashboard's Neon ingest endpoint
@@ -140,7 +146,8 @@ oLPN found — including oLPNs with no instructions yet. It opens a modal:
 - **Attach to** — "oLPN header" or "Detail N – Item X" (with a count of
   existing instructions on each).
 - **Type** — Pick or Pack.
-- **Sequence** — pre-filled with the next free number for that target.
+- **Sequence** — pre-filled with the next free number for that target
+  **and type** (sequences are numbered per target + Pick/Pack).
 - **Instruction ID** — required dropdown (starts blank; **Create** stays
   greyed out until a listed ID is selected) of the master
   instruction definitions, loaded from
@@ -185,6 +192,26 @@ working through this modal against SS-DEMO oLPN `0000099999100015677`
 (2026-09-28) — a header instruction ("Cut Paper") landed on the header and
 a detail instruction ("BOGO Sticker") on detail 1, confirming the header
 ID comes first in `OlpnAndDetailsServiceRequestorIds`.
+
+### Reorder (▲▼ arrows → `resequence_instructions`)
+
+Sequence only matters within a group: same oLPN, same target (header or
+one detail), same `InstructionType`. Arrows appear only on groups with 2+
+instructions (up disabled on the first, down on the last). Each click
+**saves immediately** — there is no Save button:
+
+1. The browser sends the group's full PK list in its new order.
+2. The backend re-reads the oLPN and refuses unless those PKs are exactly
+   one whole group (nothing missing or added since the page loaded).
+3. It renumbers the group 1..n and PUTs only the rows whose `Sequence`
+   changed — the same `PUT .../assignedInstruction/{PK}` as the text edit,
+   full entity with only `Sequence` changed (rows taken from the fresh
+   oLPN read).
+4. It re-reads the oLPN and only reports success if the new order stuck.
+
+All arrows are disabled while a save is in flight. If a save fails part
+way (e.g. the second of two PUTs), or the page was stale, the search is
+re-run so the table shows MAWM's real order, and the error is shown.
 
 ### Update and delete
 

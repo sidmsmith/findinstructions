@@ -16,6 +16,7 @@ const unmatchedList = document.getElementById('unmatchedList');
 const rawOutput = document.getElementById('rawOutput');
 const addBar = document.getElementById('addBar');
 let lastSearchValue = null;
+let lastResult = null; // last search response; edits/deletes/reorders update it and re-render
 
 function showAuthStatus(message, type) {
   authStatusEl.textContent = message;
@@ -142,12 +143,25 @@ function renderResults(res) {
   if (!res.instructions || res.instructions.length === 0) {
     resultsBody.innerHTML = `<tr><td colspan="15" class="text-muted text-center py-3">No instructions found.</td></tr>`;
   } else {
+    res.instructions.sort(compareInstructionRows);
+    const groups = new Map(); // groupKey -> ordered, de-duplicated PKs
+    for (const row of res.instructions) {
+      const key = groupKey(row);
+      if (!groups.has(key)) groups.set(key, []);
+      const pk = String(row.PK);
+      if (row.PK != null && !groups.get(key).includes(pk)) groups.get(key).push(pk);
+    }
+
+    let prevKey = null;
     for (const row of res.instructions) {
       const tr = document.createElement('tr');
+      const key = groupKey(row);
+      if (prevKey !== null && key !== prevKey) tr.classList.add('group-start');
+      prevKey = key;
       // Header-level instructions apply to the whole oLPN, not one line.
       const headerLabel = '<span class="header-label">Header</span>';
       tr.innerHTML = [
-        row.Sequence,
+        '', // Seq cell — filled by renderSequenceCell below
         escapeHtml(row.InstructionType),
         '', // Instruction cell — filled by renderInstructionCell below
         escapeHtml(row.OrderId),
@@ -163,6 +177,7 @@ function renderResults(res) {
         escapeHtml(row.InstructionRequestorId),
         escapeHtml(row.Process)
       ].map((v) => `<td>${v == null || v === '' ? '&mdash;' : v}</td>`).join('');
+      renderSequenceCell(tr.children[0], row, groups.get(key));
       const instructionCell = tr.children[2];
       instructionCell.classList.add('instruction-cell');
       instructionCell.dataset.pk = row.PK != null ? String(row.PK) : '';
@@ -195,6 +210,92 @@ function renderResults(res) {
   rawOutput.textContent = JSON.stringify(res.raw || {}, null, 2);
   renderAddBar(res.activeOlpns || []);
   resultsEl.style.display = 'block';
+}
+
+// Row order — keep in sync with compareInstructionRows in api/validate.js.
+// Per oLPN: header first, then details by number; Pick before Pack; then
+// Sequence. Each reorderable group is therefore contiguous.
+const INSTRUCTION_TYPE_ORDER = { Pick: 0, Pack: 1 };
+function compareInstructionRows(a, b) {
+  if (a.OlpnId !== b.OlpnId) return String(a.OlpnId).localeCompare(String(b.OlpnId));
+  if (a.IsHeader !== b.IsHeader) return a.IsHeader ? -1 : 1;
+  if (a.OlpnDetailId !== b.OlpnDetailId) {
+    return String(a.OlpnDetailId).localeCompare(String(b.OlpnDetailId), undefined, { numeric: true });
+  }
+  if (a.InstructionType !== b.InstructionType) {
+    const ta = INSTRUCTION_TYPE_ORDER[a.InstructionType] ?? 9;
+    const tb = INSTRUCTION_TYPE_ORDER[b.InstructionType] ?? 9;
+    return ta !== tb ? ta - tb : String(a.InstructionType).localeCompare(String(b.InstructionType));
+  }
+  return (Number(a.Sequence) || 0) - (Number(b.Sequence) || 0);
+}
+
+// Sequence only matters within one oLPN + target (header or one detail) +
+// InstructionType.
+function groupKey(row) {
+  return [row.OlpnId, row.InstructionRequestorTypeId, row.InstructionRequestorId, row.InstructionType].join('|');
+}
+
+// Seq number, plus up/down arrows when the group has more than one row.
+function renderSequenceCell(cell, row, groupPks) {
+  cell.classList.add('seq-cell');
+  const seq = row.Sequence == null || row.Sequence === '' ? '&mdash;' : escapeHtml(row.Sequence);
+  const pk = String(row.PK);
+  const i = groupPks ? groupPks.indexOf(pk) : -1;
+  if (!groupPks || groupPks.length < 2 || i < 0) {
+    cell.innerHTML = seq;
+    return;
+  }
+  cell.innerHTML =
+    `<span class="seq-num">${seq}</span>` +
+    `<span class="seq-arrows">` +
+    `<button type="button" class="seq-btn" data-dir="-1" title="Move up"${i === 0 ? ' disabled' : ''}><i class="fas fa-caret-up"></i></button>` +
+    `<button type="button" class="seq-btn" data-dir="1" title="Move down"${i === groupPks.length - 1 ? ' disabled' : ''}><i class="fas fa-caret-down"></i></button>` +
+    `</span>`;
+  cell.querySelectorAll('.seq-btn').forEach((btn) => {
+    btn.addEventListener('click', () => moveInstruction(row, groupPks, Number(btn.dataset.dir)));
+  });
+}
+
+let reorderBusy = false;
+
+// Saves immediately: swaps the row with its neighbour, and the backend
+// renumbers the whole group 1..n (only changed rows are written).
+async function moveInstruction(row, groupPks, dir) {
+  if (reorderBusy) return;
+  const pks = [...groupPks];
+  const i = pks.indexOf(String(row.PK));
+  const j = i + dir;
+  if (i < 0 || j < 0 || j >= pks.length) return;
+  [pks[i], pks[j]] = [pks[j], pks[i]];
+
+  reorderBusy = true;
+  document.querySelectorAll('.seq-btn').forEach((b) => { b.disabled = true; });
+  showStatus('Saving new order...', 'info');
+  try {
+    const res = await apiCall('resequence_instructions', { org: currentOrg, olpnId: row.OlpnId, pks });
+    if (!res.success) {
+      if (res.tokenInvalid) { handleTokenInvalid(); return; }
+      // A partial save or a stale page: reload so the table shows MAWM's
+      // real order, then report the problem.
+      if ((res.partial || res.stale) && lastSearchValue) await runSearch(lastSearchValue);
+      else if (lastResult) renderResults(lastResult);
+      showStatus(res.error || 'Reorder failed', 'error');
+      return;
+    }
+    const newSeq = new Map(res.sequences.map((x) => [String(x.pk), x.sequence]));
+    for (const r of lastResult.instructions) {
+      if (newSeq.has(String(r.PK))) r.Sequence = newSeq.get(String(r.PK));
+    }
+    renderResults(lastResult);
+    showStatus(`Reordered ${res.instructionType} instructions on oLPN ${row.OlpnId} / ${res.target}.`, 'success');
+  } catch (error) {
+    console.error('Reorder error:', error);
+    if (lastSearchValue) await runSearch(lastSearchValue);
+    showStatus(error.message || 'Reorder failed', 'error');
+  } finally {
+    reorderBusy = false;
+  }
 }
 
 // One "Add instruction" button per active oLPN in the results — including
@@ -301,9 +402,10 @@ function syncCreateButton() {
   createConfirmBtn.disabled = !valid || !!(createState && createState.busy);
 }
 
+// Sequences are numbered within target + type, so the suggestion depends on both.
 function syncCreateSequence() {
   const t = createState && createState.targets[Number(createTarget.value)];
-  if (t) createSeq.value = t.nextSequence;
+  if (t && t.nextSequenceByType) createSeq.value = t.nextSequenceByType[createType.value] || 1;
 }
 
 function closeCreateModal(force) {
@@ -369,6 +471,7 @@ async function confirmCreate() {
 }
 
 createTarget.addEventListener('change', syncCreateSequence);
+createType.addEventListener('change', syncCreateSequence);
 createInstructionId.addEventListener('change', syncCreateText);
 createConfirmBtn.addEventListener('click', confirmCreate);
 createCancelBtn.addEventListener('click', () => closeCreateModal());
@@ -444,15 +547,12 @@ async function confirmDelete() {
       deleteConfirmBtn.innerHTML = '<i class="fas fa-trash-alt"></i> Delete';
       return;
     }
-    // Remove every row carrying this PK and keep the count badge honest.
-    document.querySelectorAll('td.instruction-cell').forEach((c) => {
-      if (c.dataset.pk === cell.dataset.pk) c.closest('tr').remove();
-    });
-    const remaining = resultsBody.querySelectorAll('td.instruction-cell').length;
-    const countBadge = countsRow.querySelector('.bg-primary');
-    if (countBadge) countBadge.textContent = `Instructions found: ${remaining}`;
-    if (remaining === 0) {
-      resultsBody.innerHTML = `<tr><td colspan="15" class="text-muted text-center py-3">No instructions found.</td></tr>`;
+    // Drop every row carrying this PK and re-render (keeps counts and
+    // reorder arrows correct).
+    if (lastResult) {
+      lastResult.instructions = lastResult.instructions.filter((r) => String(r.PK) !== cell.dataset.pk);
+      if (lastResult.counts) lastResult.counts.instructions = lastResult.instructions.length;
+      renderResults(lastResult);
     }
     pendingDeleteCell = null;
     deleteModal.style.display = 'none';
@@ -516,9 +616,12 @@ function openInstructionEditor(cell) {
         return;
       }
       // Same PK can appear on more than one row — update them all.
-      document.querySelectorAll('td.instruction-cell').forEach((c) => {
-        if (c.dataset.pk === cell.dataset.pk) renderInstructionCell(c, res.instructionText);
-      });
+      if (lastResult) {
+        for (const r of lastResult.instructions) {
+          if (String(r.PK) === cell.dataset.pk) r.InstructionText = res.instructionText;
+        }
+        renderResults(lastResult);
+      }
       showStatus(`Instruction updated: "${res.previousText}" → "${res.instructionText}"`, 'success');
     } catch (error) {
       console.error('Update error:', error);
@@ -561,6 +664,7 @@ async function runSearch(value) {
       return;
     }
     hideStatus();
+    lastResult = res;
     renderResults(res);
     if ((res.counts?.instructions ?? 0) === 0) {
       showStatus(res.fellBackToOlpn

@@ -35,7 +35,7 @@ const USERNAME_BASE = process.env.MANHATTAN_USERNAME_BASE || 'sdtadmin@';
 const USAGE_INGEST_URL = (process.env.MANHATTAN_USAGE_INGEST_URL || '').trim();
 const USAGE_INGEST_SECRET = (process.env.MANHATTAN_USAGE_INGEST_SECRET || '').trim();
 const APP_NAME = 'findinstructions-app';
-const APP_VERSION = '1.7.0';
+const APP_VERSION = '1.8.0';
 
 async function forwardUsageEvent(payload) {
   if (!USAGE_INGEST_URL) {
@@ -204,6 +204,25 @@ function dataRows(resp) {
 // ---------------------------------------------------------------------------
 // Join algorithm
 // ---------------------------------------------------------------------------
+
+// Row order, shared with public/script.js (keep the two in sync): per oLPN,
+// the header first, then details by number; within a target Pick before
+// Pack; then Sequence. Each reorderable group — same oLPN, same target
+// (header or one detail), same InstructionType — is therefore contiguous.
+const INSTRUCTION_TYPE_ORDER = { Pick: 0, Pack: 1 };
+function compareInstructionRows(a, b) {
+  if (a.OlpnId !== b.OlpnId) return String(a.OlpnId).localeCompare(String(b.OlpnId));
+  if (a.IsHeader !== b.IsHeader) return a.IsHeader ? -1 : 1;
+  if (a.OlpnDetailId !== b.OlpnDetailId) {
+    return String(a.OlpnDetailId).localeCompare(String(b.OlpnDetailId), undefined, { numeric: true });
+  }
+  if (a.InstructionType !== b.InstructionType) {
+    const ta = INSTRUCTION_TYPE_ORDER[a.InstructionType] ?? 9;
+    const tb = INSTRUCTION_TYPE_ORDER[b.InstructionType] ?? 9;
+    return ta !== tb ? ta - tb : String(a.InstructionType).localeCompare(String(b.InstructionType));
+  }
+  return (Number(a.Sequence) || 0) - (Number(b.Sequence) || 0);
+}
 
 async function findInstructions({ org, mode, value }, token) {
   const orgUpper = org.toUpperCase();
@@ -442,12 +461,7 @@ async function findInstructions({ org, mode, value }, token) {
     };
   });
 
-  // Per oLPN: header instructions first, then details; each by Sequence.
-  flattened.sort((a, b) => {
-    if (a.OlpnId !== b.OlpnId) return String(a.OlpnId).localeCompare(String(b.OlpnId));
-    if (a.IsHeader !== b.IsHeader) return a.IsHeader ? -1 : 1;
-    return (Number(a.Sequence) || 0) - (Number(b.Sequence) || 0);
-  });
+  flattened.sort(compareInstructionRows);
 
   // 6. Unmatched diagnostics.
   const matchedRequestorIds = new Set(instructionRows.map((r) => String(r.InstructionRequestorId)));
@@ -696,7 +710,13 @@ async function getOlpnTargets({ org, olpnId }, token) {
       itemId: t.itemId,
       label: t.label,
       existingCount: t.existing.length,
-      nextSequence: t.existing.reduce((m, a) => Math.max(m, Number(a.Sequence) || 0), 0) + 1
+      // Sequences are numbered within target + InstructionType.
+      nextSequenceByType: Object.fromEntries(INSTRUCTION_TYPES.map((type) => [
+        type,
+        t.existing
+          .filter((a) => a.InstructionType === type)
+          .reduce((m, a) => Math.max(m, Number(a.Sequence) || 0), 0) + 1
+      ]))
     }))
   };
 }
@@ -799,6 +819,76 @@ async function createInstruction({ org, olpnId, targetType, olpnDetailId, instru
     instructionText: created.InstructionText,
     // false => saved, but the oLPN doesn't list it yet, so a search won't show it
     visibleOnOlpn: !!landedOn
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Reorder one group of instructions (same oLPN, same target, same type)
+// ---------------------------------------------------------------------------
+
+// `pks` is the group's full PK list in the desired order. Renumbers it
+// 1..n and PUTs only rows whose Sequence changes — via the same confirmed
+// update-by-PK call as the text edit, with only Sequence changed. The rows
+// come straight from a fresh oLPN read (AssignedInstruction[] carries the
+// full entity), so no per-PK re-read is needed before the PUT.
+async function resequenceInstructions({ org, olpnId, pks }, token) {
+  const orgUpper = org.toUpperCase();
+  const facilityId = `${orgUpper}-DM1`;
+
+  const before = await readOlpnWithRequestors(orgUpper, olpnId, token);
+  if (before.error) return { success: false, error: before.error };
+
+  // All PKs must be one whole group: same target, same type, nothing missing.
+  const target = before.targets.find((t) => t.existing.some((a) => String(a.PK) === pks[0]));
+  if (!target) return { success: false, error: `Instruction ${pks[0]} is not on oLPN ${olpnId}.` };
+  const first = target.existing.find((a) => String(a.PK) === pks[0]);
+  const group = target.existing.filter((a) => a.InstructionType === first.InstructionType);
+  const groupPks = new Set(group.map((a) => String(a.PK)));
+  if (pks.length !== group.length || new Set(pks).size !== pks.length || !pks.every((pk) => groupPks.has(pk))) {
+    return {
+      success: false,
+      stale: true,
+      error: `The ${first.InstructionType} instructions on ${target.label} changed since the page loaded — refresh and try again.`
+    };
+  }
+  const bad = group.find((a) => a.OrgId !== orgUpper || a.FacilityId !== facilityId);
+  if (bad) return { success: false, error: `Instruction ${bad.PK} belongs to ${bad.OrgId}/${bad.FacilityId}, not ${orgUpper}/${facilityId}.` };
+
+  const byPk = new Map(group.map((a) => [String(a.PK), a]));
+  const changes = pks
+    .map((pk, i) => ({ row: byPk.get(pk), sequence: i + 1 }))
+    .filter((c) => Number(c.row.Sequence) !== c.sequence);
+
+  for (const c of changes) {
+    const payload = {};
+    for (const f of ASSIGNED_INSTRUCTION_ENTITY_FIELDS) payload[f] = c.row[f];
+    payload.Sequence = c.sequence;
+    const putPath = `${ASSIGNED_INSTRUCTION_BASE_PATH}/${encodeURIComponent(c.row.PK)}`;
+    const putResp = await mawmRequest('PUT', putPath, token, orgUpper, payload);
+    if (!putResp.httpOk || putResp.parseError || putResp.success === false) {
+      return {
+        success: false,
+        partial: changes.indexOf(c) > 0,
+        error: `Updating the sequence of "${c.row.InstructionText}" failed ${describeMawmFailure(putResp)}`
+      };
+    }
+  }
+
+  // Confirm the new order actually persisted.
+  const after = await readOlpnWithRequestors(orgUpper, olpnId, token);
+  if (after.error) return { success: false, partial: true, error: `Saved, but re-reading oLPN ${olpnId} failed: ${after.error}` };
+  const afterRows = new Map(after.targets.flatMap((t) => t.existing).map((a) => [String(a.PK), a]));
+  const wrong = pks.find((pk, i) => !afterRows.has(pk) || Number(afterRows.get(pk).Sequence) !== i + 1);
+  if (wrong) {
+    return { success: false, partial: true, error: 'MAWM accepted the update, but re-reading the oLPN shows a different order.' };
+  }
+
+  return {
+    success: true,
+    target: target.label,
+    instructionType: first.InstructionType,
+    sequences: pks.map((pk, i) => ({ pk, sequence: i + 1 })),
+    updatedCount: changes.length
   };
 }
 
@@ -957,6 +1047,32 @@ async function handler(req, res) {
       console.error('[create_instruction] error:', e);
       await forwardUsageEvent({ event_name: 'instruction_create_failed', org: String(org).toUpperCase(), error: e.message });
       return res.json({ success: false, error: e.message || 'Create failed', tokenInvalid: !!e.tokenInvalid });
+    }
+  }
+
+  if (action === 'resequence_instructions') {
+    const org = req.body.org;
+    const olpnId = req.body.olpnId != null ? String(req.body.olpnId).trim() : '';
+    const pks = Array.isArray(req.body.pks) ? req.body.pks.map((x) => String(x).trim()) : [];
+
+    if (!org || !String(org).trim()) return res.status(400).json({ success: false, error: 'ORG required' });
+    if (!olpnId) return res.status(400).json({ success: false, error: 'olpnId required' });
+    if (pks.length < 2 || pks.length > 50 || !pks.every((pk) => /^-?\d+$/.test(pk))) {
+      return res.status(400).json({ success: false, error: 'pks must be 2–50 numeric instruction PKs' });
+    }
+
+    try {
+      const result = await resequenceInstructions({ org, olpnId, pks }, token);
+      await forwardUsageEvent({
+        event_name: result.success ? 'instructions_resequenced' : 'instructions_resequence_failed',
+        org: String(org).toUpperCase(),
+        ...(result.success ? { updatedCount: result.updatedCount } : { error: result.error })
+      });
+      return res.json(result);
+    } catch (e) {
+      console.error('[resequence_instructions] error:', e);
+      await forwardUsageEvent({ event_name: 'instructions_resequence_failed', org: String(org).toUpperCase(), error: e.message });
+      return res.json({ success: false, partial: true, error: e.message || 'Reorder failed', tokenInvalid: !!e.tokenInvalid });
     }
   }
 
