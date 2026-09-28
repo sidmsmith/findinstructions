@@ -689,6 +689,25 @@ async function handler(req, res) {
     }
   }
 
+  // Read-only: the full oLPN record (no Template) for one oLPN, used to work
+  // out how OlpnAndDetailsServiceRequestorIds maps to the header and each
+  // OlpnDetail before building "create instruction".
+  if (action === 'olpn_targets') {
+    const org = req.body.org;
+    const olpnId = req.body.olpnId != null ? String(req.body.olpnId).trim() : '';
+    if (!org || !String(org).trim()) return res.status(400).json({ success: false, error: 'ORG required' });
+    if (!olpnId) return res.status(400).json({ success: false, error: 'olpnId required' });
+    try {
+      const resp = await mawmPost(OLPN_SEARCH_PATH, token, String(org).toUpperCase(), {
+        Query: `OlpnId ='${escapeQuoted(olpnId)}'`,
+        Size: 5
+      });
+      return res.json({ success: resp.httpOk && resp.success !== false, httpStatus: resp.httpStatus, rows: dataRows(resp) });
+    } catch (e) {
+      return res.json({ success: false, error: e.message, tokenInvalid: !!e.tokenInvalid });
+    }
+  }
+
   if (action === 'update_instruction') {
     const org = req.body.org;
     const pk = req.body.pk != null ? String(req.body.pk).trim() : '';
