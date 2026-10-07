@@ -35,7 +35,7 @@ const USERNAME_BASE = process.env.MANHATTAN_USERNAME_BASE || 'sdtadmin@';
 const USAGE_INGEST_URL = (process.env.MANHATTAN_USAGE_INGEST_URL || '').trim();
 const USAGE_INGEST_SECRET = (process.env.MANHATTAN_USAGE_INGEST_SECRET || '').trim();
 const APP_NAME = 'findinstructions-app';
-const APP_VERSION = '1.11.0';
+const APP_VERSION = '1.12.0';
 
 async function forwardUsageEvent(payload) {
   if (!USAGE_INGEST_URL) {
@@ -1191,6 +1191,49 @@ async function vasDeleteInstruction({ org, servicePk, stepPk, instructionPk }, t
   return { success: true, pk: String(instructionPk), deletedText: ctx.instruction.InstructionText, steps: shapeVasSteps(v.svc) };
 }
 
+// Reorder a step's VAS instructions: `pks` is the step's full instruction
+// PK list in the new order. One save carries every changed {PK, Sequence},
+// so the reorder is a single MAWM transaction (unlike Pick/Pack reorder,
+// which is one PUT per row).
+async function vasResequenceInstructions({ org, servicePk, stepPk, pks }, token) {
+  const orgUpper = org.toUpperCase();
+  const ctx = await loadEditableVasStep(orgUpper, servicePk, stepPk, null, token);
+  if (ctx.error) return { success: false, error: ctx.error };
+
+  const current = ctx.instructions.map((i) => String(i.PK));
+  if (pks.length !== current.length || new Set(pks).size !== pks.length || !pks.every((pk) => current.includes(pk))) {
+    return { success: false, stale: true, error: `The instructions on step "${ctx.step.StepDescription}" changed since the page loaded — refresh and try again.` };
+  }
+  const byPk = new Map(ctx.instructions.map((i) => [String(i.PK), i]));
+  const changes = pks
+    .map((pk, i) => ({ PK: pk, Sequence: i + 1 }))
+    .filter((c) => Number(byPk.get(c.PK).Sequence) !== c.Sequence);
+  if (changes.length === 0) return { success: true, updatedCount: 0, steps: null };
+
+  const resp = await mawmPost(ASSIGNED_SERVICE_SAVE_PATH, token, orgUpper, {
+    PK: String(servicePk),
+    AssignedServiceStep: [{ PK: String(stepPk), AssignedServiceStepInstruction: changes }]
+  });
+  if (!resp.httpOk || resp.parseError || resp.success === false) {
+    return { success: false, error: `Reorder failed ${describeMawmFailure(resp)}` };
+  }
+
+  // Verify: same instructions, same ids/texts, sequences exactly 1..n in the new order.
+  const r = await getAssignedServiceByPk(orgUpper, servicePk, token);
+  if (r.error) return { success: false, stale: true, error: `Saved, but re-reading failed: ${r.error}` };
+  const step = asArray(r.svc.AssignedServiceStep).find((st) => String(st.PK) === String(stepPk));
+  const after = new Map(asArray(step && step.AssignedServiceStepInstruction).map((i) => [String(i.PK), i]));
+  const bad = pks.find((pk, i) => {
+    const a = after.get(pk); const b = byPk.get(pk);
+    return !a || Number(a.Sequence) !== i + 1 || a.InstructionText !== b.InstructionText ||
+      a.AssignedServiceStepInstructionId !== b.AssignedServiceStepInstructionId;
+  });
+  if (bad || after.size !== pks.length) {
+    return { success: false, stale: true, error: 'MAWM accepted the reorder, but re-reading shows a different result — refresh and check.' };
+  }
+  return { success: true, updatedCount: changes.length, stepDescription: step.StepDescription, steps: shapeVasSteps(r.svc) };
+}
+
 // ---------------------------------------------------------------------------
 // HTTP handler
 // ---------------------------------------------------------------------------
@@ -1346,6 +1389,34 @@ async function handler(req, res) {
       console.error('[create_instruction] error:', e);
       await forwardUsageEvent({ event_name: 'instruction_create_failed', org: String(org).toUpperCase(), error: e.message });
       return res.json({ success: false, error: e.message || 'Create failed', tokenInvalid: !!e.tokenInvalid });
+    }
+  }
+
+  if (action === 'vas_resequence_instructions') {
+    const org = req.body.org;
+    const servicePk = req.body.servicePk != null ? String(req.body.servicePk).trim() : '';
+    const stepPk = req.body.stepPk != null ? String(req.body.stepPk).trim() : '';
+    const pks = Array.isArray(req.body.pks) ? req.body.pks.map((x) => String(x).trim()) : [];
+    const isNumeric = (v) => /^-?\d+$/.test(v);
+    if (!org || !String(org).trim()) return res.status(400).json({ success: false, error: 'ORG required' });
+    if (!isNumeric(servicePk) || !isNumeric(stepPk)) {
+      return res.status(400).json({ success: false, error: 'Numeric servicePk and stepPk are required' });
+    }
+    if (pks.length < 2 || pks.length > 50 || !pks.every(isNumeric)) {
+      return res.status(400).json({ success: false, error: 'pks must be 2–50 numeric instruction PKs' });
+    }
+    try {
+      const result = await vasResequenceInstructions({ org, servicePk, stepPk, pks }, token);
+      await forwardUsageEvent({
+        event_name: result.success ? 'vas_instructions_resequenced' : 'vas_instructions_resequence_failed',
+        org: String(org).toUpperCase(),
+        ...(result.success ? { updatedCount: result.updatedCount } : { error: result.error })
+      });
+      return res.json(result);
+    } catch (e) {
+      console.error('[vas_resequence_instructions] error:', e);
+      await forwardUsageEvent({ event_name: 'vas_instructions_resequence_failed', org: String(org).toUpperCase(), error: e.message });
+      return res.json({ success: false, stale: true, error: e.message || 'Reorder failed', tokenInvalid: !!e.tokenInvalid });
     }
   }
 

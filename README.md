@@ -162,6 +162,7 @@ steps and instructions are left unchanged.
 | `vas_create_instruction` | `{AssignedServiceStepInstructionId, InstructionText, Sequence}` — no PK (MAWM generates it); id generated as `{ProvidedServiceId}_{StepId}_ins_{random}` (≤ 50 chars, same style as existing ids); appended at the end of the step |
 | `vas_update_instruction` | `{PK, InstructionText}` |
 | `vas_delete_instruction` | `{ApplyAction: "DELETE", PK}` |
+| `vas_resequence_instructions` | one `{PK, Sequence}` per instruction whose number changes |
 
 Each action first re-reads the service (`GET .../assignedService/{PK}`)
 and refuses unless it belongs to `{ORG}`/`{ORG}-DM1`, the service and step
@@ -170,7 +171,15 @@ and only reports success if the change is there **and every other
 instruction on the step is unchanged**. MAWM stamps touched rows'
 `Process` with `/fw-aux-svcs/assignedService/save` (audit only).
 
-Reordering VAS instructions is not built yet (not verified).
+**Reorder** (▲▼ next to each instruction when a Created step has 2+):
+saves immediately, like the Pick/Pack arrows. `vas_resequence_instructions`
+sends the step's full PK list in the new order; the server checks it is
+exactly the step's current instructions, then sends **one** save whose
+instruction list is just the changed `{PK, Sequence}` pairs — so the whole
+renumber is a single MAWM transaction (Pick/Pack reorder needs one PUT
+per row). It re-reads and only reports success if the sequences are
+1…n in the new order with ids and texts unchanged; otherwise it reloads
+the search. Confirmed on SS-DEMO (swap and swap back, 2026-10-06).
 
 **Big numbers**: MAWM returns the nested parent references
 (`AssignedService.PK`, `AssignedServiceStep.PK`) as bare 19-digit JSON
@@ -188,6 +197,7 @@ If `MANHATTAN_USAGE_INGEST_URL` is set, the app forwards `app_opened`,
 `instruction_created`/`instruction_create_failed`,
 `instructions_resequenced`/`instructions_resequence_failed`,
 `vas_instruction_created`/`_updated`/`_deleted` (and `vas_instruction_create_failed` etc.),
+`vas_instructions_resequenced`/`vas_instructions_resequence_failed`,
 `instruction_updated`/`instruction_update_failed`, and
 `instruction_deleted`/`instruction_delete_failed` events to the Manhattan
 App Usage Dashboard's Neon ingest endpoint

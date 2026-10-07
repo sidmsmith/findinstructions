@@ -272,8 +272,13 @@ function renderVas(services) {
     ].filter(Boolean).join(' · ');
     const steps = (svc.Steps || []).map((st) => {
       const ctx = `data-svc="${escapeHtml(svc.PK)}" data-step="${escapeHtml(st.PK)}"`;
-      const items = (st.Instructions || []).map((i) => `
+      const n = (st.Instructions || []).length;
+      const items = (st.Instructions || []).map((i, idx) => `
         <li ${ctx} data-ins="${escapeHtml(i.PK)}">
+          ${st.Editable && n > 1 ? `<span class="seq-arrows vas-arrows">` +
+            `<button type="button" class="seq-btn" data-vas-action="up" title="Move up"${idx === 0 ? ' disabled' : ''}><i class="fas fa-caret-up"></i></button>` +
+            `<button type="button" class="seq-btn" data-vas-action="down" title="Move down"${idx === n - 1 ? ' disabled' : ''}><i class="fas fa-caret-down"></i></button>` +
+            `</span>` : ''}
           <span class="vas-ins-text">${escapeHtml(i.InstructionText)}</span>
           ${st.Editable ? `
             <button type="button" class="btn btn-link btn-sm p-0 ms-1 edit-instruction-btn" data-vas-action="edit" title="Edit VAS instruction text"><i class="fas fa-pencil-alt"></i></button><button type="button" class="btn btn-link btn-sm p-0 ms-2 delete-instruction-btn" data-vas-action="delete" title="Delete VAS instruction"><i class="fas fa-trash-alt"></i></button>` : ''}
@@ -361,11 +366,14 @@ async function runVasWrite(action, payload, successMessage) {
     const res = await apiCall(action, { org: currentOrg, ...payload });
     if (!res.success) {
       if (res.tokenInvalid) { handleTokenInvalid(); return res; }
-      if (lastResult) renderResults(lastResult); // drop the editor, keep current data
+      // Stale page or uncertain outcome: reload so the cards show MAWM's
+      // real state; otherwise just drop the editor and keep current data.
+      if (res.stale && lastSearchValue) await runSearch(lastSearchValue);
+      else if (lastResult) renderResults(lastResult);
       showStatus(res.error || 'VAS change failed', 'error');
       return res;
     }
-    applyVasSteps(payload.servicePk, res.steps);
+    if (res.steps) applyVasSteps(payload.servicePk, res.steps);
     showStatus(successMessage(res), 'success');
     return res;
   } catch (error) {
@@ -385,7 +393,21 @@ async function onVasAction(btn) {
   const servicePk = host.dataset.svc;
   const stepPk = host.dataset.step;
 
-  if (action === 'edit') {
+  if (action === 'up' || action === 'down') {
+    // Saves immediately, like the Pick/Pack arrows: one save renumbers the step.
+    const svc = (lastResult.vasServices || []).find((v) => String(v.PK) === servicePk);
+    const step = svc && svc.Steps.find((s) => String(s.PK) === stepPk);
+    if (!step) return;
+    const pks = step.Instructions.map((i) => String(i.PK));
+    const i = pks.indexOf(btn.closest('li[data-ins]').dataset.ins);
+    const j = i + (action === 'up' ? -1 : 1);
+    if (i < 0 || j < 0 || j >= pks.length) return;
+    [pks[i], pks[j]] = [pks[j], pks[i]];
+    document.querySelectorAll('#vasList [data-vas-action]').forEach((b) => { b.disabled = true; });
+    showStatus('Saving new order...', 'info');
+    await runVasWrite('vas_resequence_instructions', { servicePk, stepPk, pks },
+      (res) => `Reordered VAS instructions on step "${res.stepDescription || step.StepDescription}".`);
+  } else if (action === 'edit') {
     const li = btn.closest('li[data-ins]');
     const pk = li.dataset.ins;
     const original = vasInstructionText(servicePk, stepPk, pk);
