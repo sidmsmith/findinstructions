@@ -35,7 +35,13 @@ const USERNAME_BASE = process.env.MANHATTAN_USERNAME_BASE || 'sdtadmin@';
 const USAGE_INGEST_URL = (process.env.MANHATTAN_USAGE_INGEST_URL || '').trim();
 const USAGE_INGEST_SECRET = (process.env.MANHATTAN_USAGE_INGEST_SECRET || '').trim();
 const APP_NAME = 'findinstructions-app';
-const APP_VERSION = '1.15.0';
+// "VAS Execution ↗" links on VAS cards. Set VAS_EXECUTION_URL to another
+// deployment, or to "off" to hide the links.
+const VAS_EXECUTION_URL = (() => {
+  const v = (process.env.VAS_EXECUTION_URL || 'https://vasexecution.vercel.app').trim();
+  return /^off$/i.test(v) || !/^https?:\/\//i.test(v) ? null : v.replace(/\/+$/, '');
+})();
+const APP_VERSION = '1.16.0';
 
 async function forwardUsageEvent(payload) {
   if (!USAGE_INGEST_URL) {
@@ -576,6 +582,23 @@ async function findInstructions({ org, mode, value }, token) {
         { ...b, InstructionType: 'VAS' }
       ) || String(a.ProvidedServiceId).localeCompare(String(b.ProvidedServiceId))
     );
+
+    // Standard definition per VAS type (one search each), so the UI can mark
+    // steps that differ from standard. Passive: on any failure StandardSteps
+    // stays null, the UI shows no marker, and only the diagnostics log knows.
+    const types = [...new Set(vasServices.map((v) => v.ProvidedServiceId).filter(Boolean))];
+    const defs = new Map();
+    for (const typeId of types) {
+      try {
+        const def = await getVasTypeDefinition(orgUpper, typeId, token);
+        logCall(`providedService:${typeId}`, PROVIDED_SERVICE_SEARCH_PATH, `ProvidedServiceId='${typeId}'`, def.resp || {});
+        if (!def.error && def.found) defs.set(typeId, def.steps);
+      } catch (e) {
+        if (e.tokenInvalid) throw e;
+        calls.push({ label: `providedService:${typeId}`, endpoint: PROVIDED_SERVICE_SEARCH_PATH, error: e.message });
+      }
+    }
+    for (const v of vasServices) v.StandardSteps = defs.get(v.ProvidedServiceId) || null;
   }
 
   // 6. Unmatched diagnostics.
@@ -601,6 +624,7 @@ async function findInstructions({ org, mode, value }, token) {
     value,
     instructions: flattened,
     vasServices,
+    vasExecutionUrl: VAS_EXECUTION_URL,
     activeOlpns,
     counts: {
       taskDetails: taskDetails.length,
@@ -1068,23 +1092,34 @@ async function resequenceInstructions({ org, olpnId, pks }, token) {
 // VAS step instructions: create / update / delete (via assignedService/save)
 // ---------------------------------------------------------------------------
 
-// Standard (master) instructions for one step of a VAS type, in master order.
-async function getVasStepCatalog(orgUpper, providedServiceId, stepId, token) {
+// Standard (master) definition of one VAS type: stepId -> its standard
+// instructions in master order ({ id, text, sequence }). `resp` is returned
+// for the diagnostics log.
+async function getVasTypeDefinition(orgUpper, providedServiceId, token) {
   const resp = await mawmPost(PROVIDED_SERVICE_SEARCH_PATH, token, orgUpper, {
     Query: `ProvidedServiceId='${escapeQuoted(providedServiceId)}'`,
     Size: 5
   });
   if (!resp.httpOk || resp.parseError || resp.success === false) {
-    return { error: `Could not load the ${providedServiceId} definition ${describeMawmFailure(resp)}` };
+    return { error: `Could not load the ${providedServiceId} definition ${describeMawmFailure(resp)}`, resp };
   }
   const svc = dataRows(resp).find((r) => r.ProvidedServiceId === providedServiceId);
-  if (!svc) return { instructions: [] };
-  const step = asArray(svc.ProvidedServiceStep).find((st) => st.ProvidedServiceStepId === stepId);
-  const instructions = asArray(step && step.StepInstruction)
-    .filter((i) => i && i.StepInstructionId)
-    .map((i) => ({ id: String(i.StepInstructionId), text: i.InstructionText || '', sequence: Number(i.Sequence) || 0 }))
-    .sort((a, b) => a.sequence - b.sequence);
-  return { instructions };
+  const steps = {};
+  for (const st of asArray(svc && svc.ProvidedServiceStep)) {
+    if (!st || !st.ProvidedServiceStepId) continue;
+    steps[st.ProvidedServiceStepId] = asArray(st.StepInstruction)
+      .filter((i) => i && i.StepInstructionId)
+      .map((i) => ({ id: String(i.StepInstructionId), text: i.InstructionText || '', sequence: Number(i.Sequence) || 0 }))
+      .sort((a, b) => a.sequence - b.sequence);
+  }
+  return { found: !!svc, steps, resp };
+}
+
+// Standard (master) instructions for one step of a VAS type, in master order.
+async function getVasStepCatalog(orgUpper, providedServiceId, stepId, token) {
+  const def = await getVasTypeDefinition(orgUpper, providedServiceId, token);
+  if (def.error) return { error: def.error };
+  return { instructions: def.steps[stepId] || [] };
 }
 
 async function getAssignedServiceByPk(orgUpper, servicePk, token) {

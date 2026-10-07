@@ -123,6 +123,26 @@ never resolved) are surfaced in the UI rather than silently dropped.
   instructions correctly joined back to order line, item, oLPN, oLPN
   detail, and task detail.
 
+## Linked to VAS Execution (passive)
+
+- **"Differs from standard" icon.** A small note icon after a VAS step's
+  name when this oLPN's instructions for that step differ from the VAS
+  type's standard definition (`providedService` → `StepInstruction`;
+  compared by instruction id + text in sequence order). Clicking it shows
+  **Standard** vs **This oLPN** side by side (added / removed / edited /
+  moved) — the same icon and popover as VAS Execution's `diff=Y`. Such a
+  step is shown in VAS Execution with this oLPN's own instructions.
+  The search loads each VAS type's definition once and attaches it to the
+  services (`StandardSteps`); the comparison runs in the browser, so the
+  icon stays correct after VAS edits. If the definition can't be loaded,
+  there's simply no icon (the attempt is in the diagnostics panel).
+- **"VAS Execution ↗" link** on each VAS card opens that oLPN in VAS
+  Execution (with `&diff=Y` when a step differs). Base URL from the
+  `VAS_EXECUTION_URL` env var (default `https://vasexecution.vercel.app`;
+  `off` hides the links).
+- Both are hidden in Simple View. Pick/Pack instructions get neither —
+  VAS Execution doesn't show them.
+
 ## Simple View
 
 A **Simple View** checkbox at the right end of the "Add instruction" row

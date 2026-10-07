@@ -257,6 +257,108 @@ function groupLabelRow(row, count) {
 
 // VAS services on the same oLPNs — read-only, shown below the Pick/Pack
 // table, one card per service with its steps and step instructions.
+// ---- "Differs from standard" marker (same icon + popover as VAS Execution) ----
+// A step differs when its instructions (id + text, in sequence order) don't
+// match the VAS type's standard definition. Computed here from
+// svc.StandardSteps, so it stays right after VAS edits. null StandardSteps
+// (definition unavailable) or no standard for the step => no marker.
+function vasStepStandard(svc, st) {
+  const std = svc.StandardSteps && svc.StandardSteps[st.AssignedServiceStepId];
+  return Array.isArray(std) ? std.map((s) => ({ Id: s.id, Text: String(s.text || '').trim() })) : null;
+}
+function vasStepMine(st) {
+  return (st.Instructions || [])
+    .slice()
+    .sort((a, b) => (Number(a.Sequence) || 0) - (Number(b.Sequence) || 0))
+    .map((i) => ({ Id: i.AssignedServiceStepInstructionId || null, Text: String(i.InstructionText || '').trim() }));
+}
+function vasStepDiffers(svc, st) {
+  const std = vasStepStandard(svc, st);
+  if (!std) return false;
+  const mine = vasStepMine(st);
+  return std.length !== mine.length || std.some((s, i) => s.Id !== mine[i].Id || s.Text !== mine[i].Text);
+}
+function vasDiffIconHtml(svc, st) {
+  if (!vasStepDiffers(svc, st)) return '';
+  return `<button type="button" class="step-diff-btn" data-diff-svc="${escapeHtml(svc.PK)}" data-diff-step="${escapeHtml(st.PK)}"
+    title="This oLPN's instructions differ from the standard — click to compare" aria-label="Compare with standard instructions"><i class="fa-regular fa-note-sticky"></i></button>`;
+}
+
+function vasExecutionLinkHtml(svc) {
+  const base = lastResult && lastResult.vasExecutionUrl;
+  if (!base || !svc.OlpnId) return '';
+  const differs = (svc.Steps || []).some((st) => vasStepDiffers(svc, st));
+  const url = `${base}/?org=${encodeURIComponent(currentOrg)}&olpn=${encodeURIComponent(svc.OlpnId)}${differs ? '&diff=Y' : ''}`;
+  return `<a class="vas-exec-link" href="${escapeHtml(url)}" target="_blank" rel="noopener" title="Open this oLPN in VAS Execution">VAS Execution <i class="fas fa-arrow-up-right-from-square"></i></a>`;
+}
+
+// Side-by-side Standard vs This oLPN, matched by instruction id: removed,
+// added, edited (same id, new text), moved (same id + text, new position).
+function vasDiffPopoverHtml(title, std, mine) {
+  const mineById = new Map(mine.filter((m) => m.Id).map((m) => [m.Id, m]));
+  const stdById = new Map(std.filter((s) => s.Id).map((s) => [s.Id, s]));
+  const stdCommon = std.filter((s) => mineById.has(s.Id)).map((s) => s.Id);
+  const mineCommon = mine.filter((m) => stdById.has(m.Id)).map((m) => m.Id);
+  const moved = new Set(stdCommon.filter((id, i) => mineCommon[i] !== id));
+  const tag = (cls, label) => `<span class="diff-tag ${cls}">${label}</span>`;
+  const stdLines = std.map((s) => {
+    const m = mineById.get(s.Id);
+    if (!m) return `<li class="diff-removed">${escapeHtml(s.Text)} ${tag('removed', 'removed')}</li>`;
+    if (m.Text !== s.Text) return `<li class="diff-edited">${escapeHtml(s.Text)}</li>`;
+    return `<li>${escapeHtml(s.Text)}</li>`;
+  }).join('');
+  const mineLines = mine.map((m) => {
+    const s = m.Id ? stdById.get(m.Id) : null;
+    if (!s) return `<li class="diff-added">${escapeHtml(m.Text)} ${tag('added', 'added')}</li>`;
+    if (s.Text !== m.Text) return `<li class="diff-edited">${escapeHtml(m.Text)} ${tag('edited', 'edited')}</li>`;
+    if (moved.has(m.Id)) return `<li class="diff-moved">${escapeHtml(m.Text)} ${tag('moved', 'moved')}</li>`;
+    return `<li>${escapeHtml(m.Text)}</li>`;
+  }).join('');
+  return `<div class="diff-pop-head"><strong>${escapeHtml(title)}</strong>
+      <button type="button" class="diff-pop-close" aria-label="Close">&times;</button></div>
+    <div class="diff-pop-cols">
+      <div><div class="diff-col-title">Standard</div><ol>${stdLines || '<li class="text-muted">(none)</li>'}</ol></div>
+      <div><div class="diff-col-title">This oLPN</div><ol>${mineLines || '<li class="text-muted">(none — all removed)</li>'}</ol></div>
+    </div>`;
+}
+
+function closeDiffPopover() {
+  const pop = document.getElementById('diffPopover');
+  if (pop) pop.remove();
+}
+
+function openDiffPopover(btn) {
+  closeDiffPopover();
+  const svc = (lastResult && lastResult.vasServices || []).find((v) => String(v.PK) === btn.dataset.diffSvc);
+  const st = svc && svc.Steps.find((s) => String(s.PK) === btn.dataset.diffStep);
+  const std = svc && st && vasStepStandard(svc, st);
+  if (!std) return;
+  const pop = document.createElement('div');
+  pop.id = 'diffPopover';
+  pop.className = 'diff-popover';
+  pop.setAttribute('role', 'dialog');
+  pop.innerHTML = vasDiffPopoverHtml(`${svc.ProvidedServiceId} · ${st.StepDescription || ''}`, std, vasStepMine(st));
+  document.body.appendChild(pop);
+  // Fixed at the icon's on-screen position: below it, or above if no room.
+  const r = btn.getBoundingClientRect();
+  const w = pop.offsetWidth, h = pop.offsetHeight;
+  const vw = document.documentElement.clientWidth, vh = window.innerHeight;
+  let top = r.bottom + 6;
+  if (top + h > vh - 8) top = Math.max(8, r.top - h - 6);
+  pop.style.left = `${Math.max(8, Math.min(r.left - 12, vw - w - 8))}px`;
+  pop.style.top = `${top}px`;
+  pop.querySelector('.diff-pop-close').addEventListener('click', closeDiffPopover);
+}
+
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest && e.target.closest('.step-diff-btn');
+  if (btn) { e.preventDefault(); e.stopPropagation(); openDiffPopover(btn); return; }
+  if (!e.target.closest || !e.target.closest('#diffPopover')) closeDiffPopover();
+}, true);
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDiffPopover(); });
+window.addEventListener('scroll', closeDiffPopover, true);
+window.addEventListener('resize', closeDiffPopover);
+
 function renderVas(services) {
   const section = document.getElementById('vasSection');
   const list = document.getElementById('vasList');
@@ -287,7 +389,7 @@ function renderVas(services) {
         </li>`).join('');
       return `
       <li class="vas-step">
-        <div><strong>${escapeHtml(st.StepDescription || 'Step')}</strong>
+        <div><strong>${escapeHtml(st.StepDescription || 'Step')}</strong>${vasDiffIconHtml(svc, st)}
           <span class="vas-status">${escapeHtml(st.Status || '')}</span>
           ${st.RequestedQuantity != null ? `<span class="text-muted small">qty ${escapeHtml(st.CompletedQuantity ?? 0)}/${escapeHtml(st.RequestedQuantity)}</span>` : ''}
           ${st.Editable ? '' : '<span class="text-muted small"><i class="fas fa-lock"></i> read-only (only Created steps can be edited)</span>'}
@@ -303,6 +405,7 @@ function renderVas(services) {
           <span class="vas-name">${escapeHtml(svc.Description || svc.ProvidedServiceId)}</span>
           <span class="vas-status">${escapeHtml(svc.Status || '')}</span>
           <span class="group-target">${where}</span>
+          ${vasExecutionLinkHtml(svc)}
         </div>
         <ol class="vas-steps">${steps}</ol>
       </div>`;
