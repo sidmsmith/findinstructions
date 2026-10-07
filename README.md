@@ -93,8 +93,9 @@ Since these tokens expire every few hours, drop a fresh one into `.token`
    step 2's template). Each assigned service is shown below the table as a
    card — service, status, target, order line — with its
    `AssignedServiceStep[]` and each step's
-   `AssignedServiceStepInstruction[]` text. See "Assigned instructions vs.
-   VAS" below.
+   `AssignedServiceStepInstruction[]` text. Step instructions can be
+   edited, added and deleted while the step is Created — see "Editing VAS
+   step instructions" below.
 
 Unmatched records (an oLPN that couldn't be found, an oLPN detail with a
 requestor ID but no runtime instruction row, a task detail whose oLPN
@@ -134,7 +135,7 @@ oLPN header and each oLPN detail):
 | Shape | one flat row per instruction | service → `AssignedServiceStep[]` → `AssignedServiceStepInstruction[]` |
 | Instruction fields | `InstructionId`, `InstructionText`, `InstructionType`, `Sequence` | `AssignedServiceStepInstructionId`, `InstructionText`, `Sequence` |
 | Master data | `aux-svcs/instruction` | `aux-svcs/providedService` (VAS type → steps → `StepInstruction`) |
-| In this app | search, create, edit, reorder, delete | search only |
+| In this app | search, create, edit, reorder, delete | search; edit, add, delete step instructions (Created only) |
 
 The VAS endpoint and filter come from `Work/vasexecution`
 (`fetch_assigned_service_rows`). Both record types on one requestor were
@@ -142,12 +143,51 @@ observed live on SS-DEMO oLPN `0000099999100015592` detail 1 (2026-10-06),
 and the VAS rows there sit on the same header/detail ID positions as the
 assigned instructions.
 
+## Editing VAS step instructions
+
+Each instruction on a VAS card has a pencil (inline edit) and trash
+(confirmation modal); each step has **+ Add instruction** (inline). These
+appear only when the **service and the step are both Created (1000)** —
+the only status this was tested at — otherwise the step shows a
+"read-only" note.
+
+Steps and step instructions have no endpoints of their own (their GET and
+search 404), so all three go through the parent service:
+`POST /pickpack/api/fw-aux-svcs/assignedService/save` with a **partial**
+body — the service PK, the one step PK, and the one instruction. Omitted
+steps and instructions are left unchanged.
+
+| Action | Instruction object sent |
+|---|---|
+| `vas_create_instruction` | `{AssignedServiceStepInstructionId, InstructionText, Sequence}` — no PK (MAWM generates it); id generated as `{ProvidedServiceId}_{StepId}_ins_{random}` (≤ 50 chars, same style as existing ids); appended at the end of the step |
+| `vas_update_instruction` | `{PK, InstructionText}` |
+| `vas_delete_instruction` | `{ApplyAction: "DELETE", PK}` |
+
+Each action first re-reads the service (`GET .../assignedService/{PK}`)
+and refuses unless it belongs to `{ORG}`/`{ORG}-DM1`, the service and step
+are Created, and the step/instruction exist. Afterwards it re-reads again
+and only reports success if the change is there **and every other
+instruction on the step is unchanged**. MAWM stamps touched rows'
+`Process` with `/fw-aux-svcs/assignedService/save` (audit only).
+
+Reordering VAS instructions is not built yet (not verified).
+
+**Big numbers**: MAWM returns the nested parent references
+(`AssignedService.PK`, `AssignedServiceStep.PK`) as bare 19-digit JSON
+numbers, which `JSON.parse` rounds. `parseMawmJson()` quotes any bare
+16+ digit number before parsing, for every MAWM response.
+
+Evidence: endpoint and payload shapes from a Glean answer; create → update
+→ delete confirmed on SS-DEMO (2026-10-06) with the whole service diffed
+after each call.
+
 ## Usage tracking
 
 If `MANHATTAN_USAGE_INGEST_URL` is set, the app forwards `app_opened`,
 `auth_success`/`auth_failed`, `search_completed`/`search_failed`,
 `instruction_created`/`instruction_create_failed`,
 `instructions_resequenced`/`instructions_resequence_failed`,
+`vas_instruction_created`/`_updated`/`_deleted` (and `vas_instruction_create_failed` etc.),
 `instruction_updated`/`instruction_update_failed`, and
 `instruction_deleted`/`instruction_delete_failed` events to the Manhattan
 App Usage Dashboard's Neon ingest endpoint

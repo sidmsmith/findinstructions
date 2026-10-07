@@ -270,16 +270,25 @@ function renderVas(services) {
       targetLabel(svc),
       svc.OrderId ? `Order ${escapeHtml(svc.OrderId)}${svc.OrderLineId ? ` / line ${escapeHtml(svc.OrderLineId)}` : ''}` : ''
     ].filter(Boolean).join(' · ');
-    const steps = (svc.Steps || []).map((st) => `
+    const steps = (svc.Steps || []).map((st) => {
+      const ctx = `data-svc="${escapeHtml(svc.PK)}" data-step="${escapeHtml(st.PK)}"`;
+      const items = (st.Instructions || []).map((i) => `
+        <li ${ctx} data-ins="${escapeHtml(i.PK)}">
+          <span class="vas-ins-text">${escapeHtml(i.InstructionText)}</span>
+          ${st.Editable ? `
+            <button type="button" class="btn btn-link btn-sm p-0 ms-1 edit-instruction-btn" data-vas-action="edit" title="Edit VAS instruction text"><i class="fas fa-pencil-alt"></i></button><button type="button" class="btn btn-link btn-sm p-0 ms-2 delete-instruction-btn" data-vas-action="delete" title="Delete VAS instruction"><i class="fas fa-trash-alt"></i></button>` : ''}
+        </li>`).join('');
+      return `
       <li class="vas-step">
         <div><strong>${escapeHtml(st.StepDescription || 'Step')}</strong>
           <span class="vas-status">${escapeHtml(st.Status || '')}</span>
           ${st.RequestedQuantity != null ? `<span class="text-muted small">qty ${escapeHtml(st.CompletedQuantity ?? 0)}/${escapeHtml(st.RequestedQuantity)}</span>` : ''}
+          ${st.Editable ? '' : '<span class="text-muted small"><i class="fas fa-lock"></i> read-only (only Created steps can be edited)</span>'}
         </div>
-        ${(st.Instructions || []).length
-          ? `<ol class="vas-instructions">${st.Instructions.map((i) => `<li>${escapeHtml(i.InstructionText)}</li>`).join('')}</ol>`
-          : '<div class="text-muted small">No instructions</div>'}
-      </li>`).join('');
+        <ol class="vas-instructions">${items || '<li class="text-muted small vas-empty">No instructions</li>'}</ol>
+        ${st.Editable ? `<button type="button" class="btn btn-link btn-sm p-0 vas-add-btn" ${ctx} data-vas-action="add"><i class="fas fa-plus"></i> Add instruction</button>` : ''}
+      </li>`;
+    }).join('');
     return `
       <div class="vas-card">
         <div class="vas-card-head">
@@ -293,6 +302,128 @@ function renderVas(services) {
   }).join('');
   section.style.display = 'block';
 }
+
+// ---- VAS step instructions: edit / add / delete ----
+// Writes go through the backend's vas_* actions, which re-read the service,
+// only touch Created services/steps, and verify the step's other
+// instructions are unchanged. On success the step list in lastResult is
+// replaced with the server's fresh copy and everything re-renders.
+let vasBusy = false;
+
+function applyVasSteps(servicePk, steps) {
+  const svc = lastResult && (lastResult.vasServices || []).find((v) => String(v.PK) === String(servicePk));
+  if (svc && steps) svc.Steps = steps;
+  if (lastResult) renderResults(lastResult);
+}
+
+function vasInstructionText(servicePk, stepPk, pk) {
+  const svc = lastResult && (lastResult.vasServices || []).find((v) => String(v.PK) === String(servicePk));
+  const step = svc && svc.Steps.find((s) => String(s.PK) === String(stepPk));
+  const ins = step && step.Instructions.find((i) => String(i.PK) === String(pk));
+  return ins ? ins.InstructionText : '';
+}
+
+// Inline text editor inside `host`; resolves with the trimmed text, or
+// null when cancelled.
+function inlineTextEditor(host, initial, placeholder) {
+  return new Promise((resolve) => {
+    host.innerHTML = `
+      <div class="d-flex gap-1 align-items-center instruction-editor">
+        <input type="text" class="form-control form-control-sm" maxlength="500" placeholder="${placeholder || ''}" />
+        <button type="button" class="btn btn-success btn-sm save-btn" title="Save"><i class="fas fa-check"></i></button>
+        <button type="button" class="btn btn-outline-secondary btn-sm cancel-btn" title="Cancel"><i class="fas fa-times"></i></button>
+      </div>`;
+    const input = host.querySelector('input');
+    input.value = initial || '';
+    input.focus();
+    input.select();
+    const done = (v) => {
+      host.querySelectorAll('input, button').forEach((el) => { el.disabled = true; });
+      if (v !== null) host.querySelector('.save-btn').innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+      resolve(v);
+    };
+    host.querySelector('.save-btn').addEventListener('click', () => {
+      const v = input.value.trim();
+      if (!v) { showStatus('Instruction text cannot be empty.', 'error'); return; }
+      done(v);
+    });
+    host.querySelector('.cancel-btn').addEventListener('click', () => done(null));
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') host.querySelector('.save-btn').click();
+      else if (e.key === 'Escape') { e.stopPropagation(); done(null); }
+    });
+  });
+}
+
+async function runVasWrite(action, payload, successMessage) {
+  vasBusy = true;
+  try {
+    const res = await apiCall(action, { org: currentOrg, ...payload });
+    if (!res.success) {
+      if (res.tokenInvalid) { handleTokenInvalid(); return res; }
+      if (lastResult) renderResults(lastResult); // drop the editor, keep current data
+      showStatus(res.error || 'VAS change failed', 'error');
+      return res;
+    }
+    applyVasSteps(payload.servicePk, res.steps);
+    showStatus(successMessage(res), 'success');
+    return res;
+  } catch (error) {
+    console.error('VAS write error:', error);
+    if (lastResult) renderResults(lastResult);
+    showStatus(error.message || 'VAS change failed', 'error');
+    return { success: false, error: error.message };
+  } finally {
+    vasBusy = false;
+  }
+}
+
+async function onVasAction(btn) {
+  if (vasBusy) return;
+  const action = btn.dataset.vasAction;
+  const host = btn.closest('[data-step]');
+  const servicePk = host.dataset.svc;
+  const stepPk = host.dataset.step;
+
+  if (action === 'edit') {
+    const li = btn.closest('li[data-ins]');
+    const pk = li.dataset.ins;
+    const original = vasInstructionText(servicePk, stepPk, pk);
+    const text = await inlineTextEditor(li, original);
+    if (text === null || text === original) { if (lastResult) renderResults(lastResult); return; }
+    await runVasWrite('vas_update_instruction', { servicePk, stepPk, instructionPk: pk, instructionText: text },
+      (res) => `VAS instruction updated: "${res.previousText}" → "${res.instructionText}"`);
+  } else if (action === 'delete') {
+    const pk = btn.closest('li[data-ins]').dataset.ins;
+    openDeleteModal({
+      text: vasInstructionText(servicePk, stepPk, pk),
+      run: async () => {
+        const res = await apiCall('vas_delete_instruction', { org: currentOrg, servicePk, stepPk, instructionPk: pk });
+        if (res.success) {
+          applyVasSteps(servicePk, res.steps);
+          res.message = `VAS instruction deleted: "${res.deletedText}"`;
+        }
+        return res;
+      }
+    });
+  } else if (action === 'add') {
+    const list = btn.parentElement.querySelector('.vas-instructions');
+    const empty = list.querySelector('.vas-empty');
+    if (empty) empty.remove();
+    const li = document.createElement('li');
+    list.appendChild(li);
+    btn.style.display = 'none';
+    const text = await inlineTextEditor(li, '', 'New VAS instruction text');
+    if (text === null) { if (lastResult) renderResults(lastResult); return; }
+    await runVasWrite('vas_create_instruction', { servicePk, stepPk, instructionText: text },
+      (res) => `VAS instruction added: "${res.instructionText}"`);
+  }
+}
+
+document.getElementById('vasList').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-vas-action]');
+  if (btn) onVasAction(btn);
+});
 
 // Sequence only matters within one oLPN + target (header or one detail) +
 // InstructionType.
@@ -566,7 +697,21 @@ function renderInstructionCell(cell, text) {
       : '');
   if (canEdit) {
     cell.querySelector('.edit-instruction-btn').addEventListener('click', () => openInstructionEditor(cell));
-    cell.querySelector('.delete-instruction-btn').addEventListener('click', () => openDeleteModal(cell));
+    cell.querySelector('.delete-instruction-btn').addEventListener('click', () => openDeleteModal({
+      text: cell.dataset.text,
+      run: async () => {
+        const res = await apiCall('delete_instruction', { org: currentOrg, pk: cell.dataset.pk });
+        if (res.success && lastResult) {
+          // Drop every row carrying this PK and re-render (keeps counts and
+          // reorder arrows correct).
+          lastResult.instructions = lastResult.instructions.filter((r) => String(r.PK) !== cell.dataset.pk);
+          if (lastResult.counts) lastResult.counts.instructions = lastResult.instructions.length;
+          renderResults(lastResult);
+          res.message = `Instruction deleted: "${res.deletedText}"`;
+        }
+        return res;
+      }
+    }));
   }
 }
 
@@ -584,11 +729,11 @@ const deleteModalText = document.getElementById('deleteModalText');
 const deleteModalError = document.getElementById('deleteModalError');
 const deleteConfirmBtn = document.getElementById('deleteConfirmBtn');
 const deleteCancelBtn = document.getElementById('deleteCancelBtn');
-let pendingDeleteCell = null;
+let pendingDelete = null; // { text, run } — run() performs the delete and returns the API result
 
-function openDeleteModal(cell) {
-  pendingDeleteCell = cell;
-  deleteModalText.textContent = cell.dataset.text || '(no text)';
+function openDeleteModal(req) {
+  pendingDelete = req;
+  deleteModalText.textContent = req.text || '(no text)';
   deleteModalError.style.display = 'none';
   deleteConfirmBtn.disabled = deleteCancelBtn.disabled = false;
   deleteConfirmBtn.innerHTML = '<i class="fas fa-trash-alt"></i> Delete';
@@ -597,21 +742,21 @@ function openDeleteModal(cell) {
 }
 
 function closeDeleteModal() {
-  if (deleteConfirmBtn.disabled && pendingDeleteCell) return; // delete in flight
+  if (deleteConfirmBtn.disabled && pendingDelete) return; // delete in flight
   deleteModal.style.display = 'none';
-  pendingDeleteCell = null;
+  pendingDelete = null;
 }
 
 async function confirmDelete() {
-  const cell = pendingDeleteCell;
-  if (!cell) return;
+  const req = pendingDelete;
+  if (!req) return;
   deleteConfirmBtn.disabled = deleteCancelBtn.disabled = true;
   deleteConfirmBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Deleting...';
   try {
-    const res = await apiCall('delete_instruction', { org: currentOrg, pk: cell.dataset.pk });
+    const res = await req.run();
     if (!res.success) {
       if (res.tokenInvalid) {
-        pendingDeleteCell = null;
+        pendingDelete = null;
         deleteModal.style.display = 'none';
         handleTokenInvalid();
         return;
@@ -622,16 +767,9 @@ async function confirmDelete() {
       deleteConfirmBtn.innerHTML = '<i class="fas fa-trash-alt"></i> Delete';
       return;
     }
-    // Drop every row carrying this PK and re-render (keeps counts and
-    // reorder arrows correct).
-    if (lastResult) {
-      lastResult.instructions = lastResult.instructions.filter((r) => String(r.PK) !== cell.dataset.pk);
-      if (lastResult.counts) lastResult.counts.instructions = lastResult.instructions.length;
-      renderResults(lastResult);
-    }
-    pendingDeleteCell = null;
+    pendingDelete = null;
     deleteModal.style.display = 'none';
-    showStatus(`Instruction deleted: "${res.deletedText}"`, 'success');
+    showStatus(res.message || 'Deleted.', 'success');
   } catch (error) {
     console.error('Delete error:', error);
     deleteModalError.textContent = error.message || 'Delete failed';

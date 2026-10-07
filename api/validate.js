@@ -35,7 +35,7 @@ const USERNAME_BASE = process.env.MANHATTAN_USERNAME_BASE || 'sdtadmin@';
 const USAGE_INGEST_URL = (process.env.MANHATTAN_USAGE_INGEST_URL || '').trim();
 const USAGE_INGEST_SECRET = (process.env.MANHATTAN_USAGE_INGEST_SECRET || '').trim();
 const APP_NAME = 'findinstructions-app';
-const APP_VERSION = '1.10.0';
+const APP_VERSION = '1.11.0';
 
 async function forwardUsageEvent(payload) {
   if (!USAGE_INGEST_URL) {
@@ -64,6 +64,16 @@ const ASSIGNED_INSTRUCTION_SEARCH_PATH = '/pickpack/api/fw-aux-svcs/assignedInst
 // (fetch_assigned_service_rows); both kinds of record on one requestor
 // observed live on SS-DEMO oLPN 0000099999100015592 detail 1 (2026-10-06).
 const ASSIGNED_SERVICE_SEARCH_PATH = '/pickpack/api/fw-aux-svcs/assignedService/search';
+// VAS step instructions have no endpoints of their own; they are created,
+// updated and deleted through the parent service's save with a PARTIAL
+// nested body (omitted steps/instructions are left unchanged; delete uses
+// ApplyAction "DELETE"). OBSERVED on SS-DEMO 2026-10-06 (create -> update ->
+// delete of a throwaway instruction, whole service diffed after each call;
+// only the new row and the Process audit stamp changed). Only tested while
+// the service is Created (1000), so the app only edits Created services.
+const ASSIGNED_SERVICE_SAVE_PATH = '/pickpack/api/fw-aux-svcs/assignedService/save';
+const ASSIGNED_SERVICE_GET_PATH = '/pickpack/api/fw-aux-svcs/assignedService';
+const VAS_EDITABLE_STATUS = '1000';
 // Same mapping as Work/vasexecution's ASSIGNED_SERVICE_STATUS.
 const ASSIGNED_SERVICE_STATUS = { 1000: 'Created', 2000: 'In Progress', 5000: 'Complete', 8000: 'Cancelled', 9000: 'Failed' };
 // Update-by-PK: PUT {base}/{PK} with the full entity (PK in the body too),
@@ -189,11 +199,19 @@ async function mawmRequest(method, path, token, org, payload) {
   const text = await res.text();
   let json;
   try {
-    json = JSON.parse(text);
+    json = parseMawmJson(text);
   } catch (e) {
     return { httpOk: res.ok, httpStatus: res.status, parseError: true, raw: text };
   }
   return { httpOk: res.ok, httpStatus: res.status, ...json };
+}
+
+// MAWM returns some IDs (e.g. assignedService's nested AssignedService.PK /
+// AssignedServiceStep.PK) as bare 19-digit JSON numbers, which JSON.parse
+// silently rounds (…831231 -> …832000). Quote any bare 16+ digit number
+// before parsing so every ID survives exactly.
+function parseMawmJson(text) {
+  return JSON.parse(text.replace(/(:\s*)(-?\d{16,})(?=\s*[,}\]])/g, '$1"$2"'));
 }
 
 function escapeQuoted(value) {
@@ -212,6 +230,37 @@ function dataRows(resp) {
 // ---------------------------------------------------------------------------
 // Join algorithm
 // ---------------------------------------------------------------------------
+
+// Steps + step instructions of one assigned service, as the UI shows them.
+// A step is editable only while both it and its service are Created.
+function shapeVasSteps(svc) {
+  const svcStatus = svc.StatusId != null ? String(svc.StatusId) : null;
+  return asArray(svc.AssignedServiceStep)
+    .map((st) => {
+      const stepStatusId = st.StatusId != null ? String(st.StatusId) : svcStatus;
+      return {
+        AssignedServiceStepId: st.AssignedServiceStepId,
+        StepDescription: st.StepDescription,
+        Sequence: st.Sequence,
+        StatusId: stepStatusId,
+        Status: ASSIGNED_SERVICE_STATUS[stepStatusId] || stepStatusId,
+        RequestedQuantity: st.RequestedQuantity,
+        CompletedQuantity: st.CompletedQuantity,
+        PK: st.PK != null ? String(st.PK) : null,
+        Editable: svcStatus === VAS_EDITABLE_STATUS && stepStatusId === VAS_EDITABLE_STATUS,
+        Instructions: asArray(st.AssignedServiceStepInstruction)
+          .filter((i) => i && i.InstructionText)
+          .map((i) => ({
+            Sequence: i.Sequence,
+            InstructionText: i.InstructionText,
+            AssignedServiceStepInstructionId: i.AssignedServiceStepInstructionId,
+            PK: i.PK != null ? String(i.PK) : null
+          }))
+          .sort((a, b) => (Number(a.Sequence) || 0) - (Number(b.Sequence) || 0))
+      };
+    })
+    .sort((a, b) => (Number(a.Sequence) || 0) - (Number(b.Sequence) || 0));
+}
 
 // Row order, shared with public/script.js (keep the two in sync): per oLPN,
 // the header first, then details by number; within a target Pick before
@@ -512,25 +561,8 @@ async function findInstructions({ org, mode, value }, token) {
         StatusId: statusId,
         Status: ASSIGNED_SERVICE_STATUS[statusId] || statusId,
         PK: svc.PK,
-        Steps: asArray(svc.AssignedServiceStep)
-          .map((st) => {
-            const stepStatusId = st.StatusId != null ? String(st.StatusId) : statusId;
-            return {
-              AssignedServiceStepId: st.AssignedServiceStepId,
-              StepDescription: st.StepDescription,
-              Sequence: st.Sequence,
-              StatusId: stepStatusId,
-              Status: ASSIGNED_SERVICE_STATUS[stepStatusId] || stepStatusId,
-              RequestedQuantity: st.RequestedQuantity,
-              CompletedQuantity: st.CompletedQuantity,
-              PK: st.PK,
-              Instructions: asArray(st.AssignedServiceStepInstruction)
-                .filter((i) => i && i.InstructionText)
-                .map((i) => ({ Sequence: i.Sequence, InstructionText: i.InstructionText, PK: i.PK }))
-                .sort((a, b) => (Number(a.Sequence) || 0) - (Number(b.Sequence) || 0))
-            };
-          })
-          .sort((a, b) => (Number(a.Sequence) || 0) - (Number(b.Sequence) || 0))
+        Editable: statusId === VAS_EDITABLE_STATUS,
+        Steps: shapeVasSteps(svc)
       });
     }
     vasServices.sort((a, b) =>
@@ -1008,6 +1040,157 @@ async function resequenceInstructions({ org, olpnId, pks }, token) {
 }
 
 // ---------------------------------------------------------------------------
+// VAS step instructions: create / update / delete (via assignedService/save)
+// ---------------------------------------------------------------------------
+
+async function getAssignedServiceByPk(orgUpper, servicePk, token) {
+  const resp = await mawmRequest('GET', `${ASSIGNED_SERVICE_GET_PATH}/${encodeURIComponent(servicePk)}`, token, orgUpper);
+  if (!resp.httpOk || resp.parseError || resp.success === false || !resp.data || Array.isArray(resp.data)) {
+    return { error: `Could not read VAS service ${servicePk} ${describeMawmFailure(resp)}` };
+  }
+  return { svc: resp.data };
+}
+
+// Re-reads the service and checks it is safe to write: right org/facility,
+// service and step both Created, and (optionally) the instruction exists.
+async function loadEditableVasStep(orgUpper, servicePk, stepPk, instructionPk, token) {
+  const facilityId = `${orgUpper}-DM1`;
+  const r = await getAssignedServiceByPk(orgUpper, servicePk, token);
+  if (r.error) return r;
+  const svc = r.svc;
+  if (svc.OrgId !== orgUpper || svc.FacilityId !== facilityId) {
+    return { error: `VAS service ${servicePk} belongs to ${svc.OrgId}/${svc.FacilityId}, not ${orgUpper}/${facilityId}.` };
+  }
+  const step = asArray(svc.AssignedServiceStep).find((st) => String(st.PK) === String(stepPk));
+  if (!step) return { error: `Step ${stepPk} is not part of VAS service ${servicePk}.` };
+  const svcStatus = String(svc.StatusId);
+  const stepStatus = String(step.StatusId != null ? step.StatusId : svc.StatusId);
+  if (svcStatus !== VAS_EDITABLE_STATUS || stepStatus !== VAS_EDITABLE_STATUS) {
+    return {
+      error: `VAS instructions can only be changed while the service and step are Created (1000) — ` +
+        `this service is ${ASSIGNED_SERVICE_STATUS[svcStatus] || svcStatus}, step "${step.StepDescription}" is ` +
+        `${ASSIGNED_SERVICE_STATUS[stepStatus] || stepStatus}.`
+    };
+  }
+  const instructions = asArray(step.AssignedServiceStepInstruction);
+  let instruction = null;
+  if (instructionPk != null) {
+    instruction = instructions.find((i) => String(i.PK) === String(instructionPk));
+    if (!instruction) return { error: `Instruction ${instructionPk} is not on step "${step.StepDescription}".` };
+  }
+  return { svc, step, instructions, instruction };
+}
+
+// Fingerprint of a step's instructions (PK, id, sequence, text), excluding
+// one PK — used to prove a write left the other instructions alone.
+function stepFingerprint(instructions, excludePk) {
+  return JSON.stringify(
+    asArray(instructions)
+      .filter((i) => String(i.PK) !== String(excludePk))
+      .map((i) => [String(i.PK), i.AssignedServiceStepInstructionId, Number(i.Sequence), i.InstructionText])
+      .sort((a, b) => a[0].localeCompare(b[0]))
+  );
+}
+
+async function saveVasStepInstruction(orgUpper, servicePk, stepPk, instruction, token) {
+  const resp = await mawmPost(ASSIGNED_SERVICE_SAVE_PATH, token, orgUpper, {
+    PK: String(servicePk),
+    AssignedServiceStep: [{ PK: String(stepPk), AssignedServiceStepInstruction: [instruction] }]
+  });
+  if (!resp.httpOk || resp.parseError || resp.success === false) {
+    return { error: describeMawmFailure(resp) };
+  }
+  return {};
+}
+
+// After a write: re-read, prove the other instructions on the step are
+// untouched, and return the step's fresh instruction list for the UI.
+async function verifyVasStep(orgUpper, servicePk, stepPk, beforeInstructions, changedPk, token) {
+  const r = await getAssignedServiceByPk(orgUpper, servicePk, token);
+  if (r.error) return { error: `Saved, but re-reading failed: ${r.error}` };
+  const step = asArray(r.svc.AssignedServiceStep).find((st) => String(st.PK) === String(stepPk));
+  if (!step) return { error: 'Saved, but the step is no longer on the service.' };
+  const after = asArray(step.AssignedServiceStepInstruction);
+  if (stepFingerprint(after, changedPk) !== stepFingerprint(beforeInstructions, changedPk)) {
+    return { error: 'Saved, but other instructions on this step changed unexpectedly — refresh and check.', step, svc: r.svc };
+  }
+  return { step, svc: r.svc, after };
+}
+
+function newVasInstructionId(svc, step) {
+  // Same style as existing ids ("Embroidery_Prepare the Design_ins_awyd4dkh");
+  // MAWM's limit for this id is 50 characters (see Work/vasexecution).
+  const prefix = `${svc.ProvidedServiceId || 'VAS'}_${step.AssignedServiceStepId || 'step'}`.slice(0, 36);
+  const rand = Math.random().toString(36).slice(2, 10).padEnd(8, '0');
+  return `${prefix}_ins_${rand}`;
+}
+
+async function vasCreateInstruction({ org, servicePk, stepPk, instructionText }, token) {
+  const orgUpper = org.toUpperCase();
+  const ctx = await loadEditableVasStep(orgUpper, servicePk, stepPk, null, token);
+  if (ctx.error) return { success: false, error: ctx.error };
+
+  // Appended at the end of the step (VAS reorder isn't verified yet).
+  const sequence = ctx.instructions.reduce((m, i) => Math.max(m, Number(i.Sequence) || 0), 0) + 1;
+  const instructionId = newVasInstructionId(ctx.svc, ctx.step);
+  const saved = await saveVasStepInstruction(orgUpper, servicePk, stepPk, {
+    AssignedServiceStepInstructionId: instructionId,
+    InstructionText: instructionText,
+    Sequence: sequence
+  }, token);
+  if (saved.error) return { success: false, error: `Create failed ${saved.error}` };
+
+  const v = await verifyVasStep(orgUpper, servicePk, stepPk, ctx.instructions, null, token);
+  if (v.error && !v.step) return { success: false, error: v.error };
+  const created = asArray(v.step.AssignedServiceStepInstruction).find((i) => i.AssignedServiceStepInstructionId === instructionId);
+  if (!created) return { success: false, error: 'MAWM accepted the create, but the new instruction is not on the step.' };
+  // The new row is expected to be the only difference.
+  if (stepFingerprint(v.after || [], created.PK) !== stepFingerprint(ctx.instructions, null)) {
+    return { success: false, error: 'Created, but other instructions on this step changed unexpectedly — refresh and check.' };
+  }
+  return { success: true, pk: String(created.PK), instructionText: created.InstructionText, steps: shapeVasSteps(v.svc) };
+}
+
+async function vasUpdateInstruction({ org, servicePk, stepPk, instructionPk, instructionText }, token) {
+  const orgUpper = org.toUpperCase();
+  const ctx = await loadEditableVasStep(orgUpper, servicePk, stepPk, instructionPk, token);
+  if (ctx.error) return { success: false, error: ctx.error };
+
+  const saved = await saveVasStepInstruction(orgUpper, servicePk, stepPk, { PK: String(instructionPk), InstructionText: instructionText }, token);
+  if (saved.error) return { success: false, error: `Update failed ${saved.error}` };
+
+  const v = await verifyVasStep(orgUpper, servicePk, stepPk, ctx.instructions, instructionPk, token);
+  if (v.error) return { success: false, error: v.error };
+  const updated = v.after.find((i) => String(i.PK) === String(instructionPk));
+  if (!updated || updated.InstructionText !== instructionText) {
+    return { success: false, error: 'MAWM accepted the update, but re-reading shows the text did not change.' };
+  }
+  return {
+    success: true,
+    pk: String(instructionPk),
+    instructionText: updated.InstructionText,
+    previousText: ctx.instruction.InstructionText,
+    steps: shapeVasSteps(v.svc)
+  };
+}
+
+async function vasDeleteInstruction({ org, servicePk, stepPk, instructionPk }, token) {
+  const orgUpper = org.toUpperCase();
+  const ctx = await loadEditableVasStep(orgUpper, servicePk, stepPk, instructionPk, token);
+  if (ctx.error) return { success: false, error: ctx.error };
+
+  const saved = await saveVasStepInstruction(orgUpper, servicePk, stepPk, { ApplyAction: 'DELETE', PK: String(instructionPk) }, token);
+  if (saved.error) return { success: false, error: `Delete failed ${saved.error}` };
+
+  const v = await verifyVasStep(orgUpper, servicePk, stepPk, ctx.instructions, instructionPk, token);
+  if (v.error) return { success: false, error: v.error };
+  if (v.after.some((i) => String(i.PK) === String(instructionPk))) {
+    return { success: false, error: 'MAWM accepted the delete, but the instruction is still on the step.' };
+  }
+  return { success: true, pk: String(instructionPk), deletedText: ctx.instruction.InstructionText, steps: shapeVasSteps(v.svc) };
+}
+
+// ---------------------------------------------------------------------------
 // HTTP handler
 // ---------------------------------------------------------------------------
 
@@ -1162,6 +1345,47 @@ async function handler(req, res) {
       console.error('[create_instruction] error:', e);
       await forwardUsageEvent({ event_name: 'instruction_create_failed', org: String(org).toUpperCase(), error: e.message });
       return res.json({ success: false, error: e.message || 'Create failed', tokenInvalid: !!e.tokenInvalid });
+    }
+  }
+
+  if (action === 'vas_create_instruction' || action === 'vas_update_instruction' || action === 'vas_delete_instruction') {
+    const org = req.body.org;
+    const servicePk = req.body.servicePk != null ? String(req.body.servicePk).trim() : '';
+    const stepPk = req.body.stepPk != null ? String(req.body.stepPk).trim() : '';
+    const instructionPk = req.body.instructionPk != null ? String(req.body.instructionPk).trim() : '';
+    const instructionText = req.body.instructionText != null ? String(req.body.instructionText).trim() : '';
+    const isNumeric = (v) => /^-?\d+$/.test(v);
+
+    if (!org || !String(org).trim()) return res.status(400).json({ success: false, error: 'ORG required' });
+    if (!isNumeric(servicePk) || !isNumeric(stepPk)) {
+      return res.status(400).json({ success: false, error: 'Numeric servicePk and stepPk are required' });
+    }
+    if (action !== 'vas_create_instruction' && !isNumeric(instructionPk)) {
+      return res.status(400).json({ success: false, error: 'A numeric instructionPk is required' });
+    }
+    if (action !== 'vas_delete_instruction' && !instructionText) {
+      return res.status(400).json({ success: false, error: 'Instruction text cannot be empty' });
+    }
+
+    const verb = action.replace('vas_', '').replace('_instruction', ''); // create | update | delete
+    try {
+      const args = { org, servicePk, stepPk, instructionPk, instructionText };
+      const result = verb === 'create'
+        ? await vasCreateInstruction(args, token)
+        : verb === 'update'
+          ? await vasUpdateInstruction(args, token)
+          : await vasDeleteInstruction(args, token);
+      await forwardUsageEvent({
+        // created / updated / deleted, or create_failed / update_failed / delete_failed
+        event_name: result.success ? `vas_instruction_${verb}d` : `vas_instruction_${verb}_failed`,
+        org: String(org).toUpperCase(),
+        ...(result.success ? {} : { error: result.error })
+      });
+      return res.json(result);
+    } catch (e) {
+      console.error(`[${action}] error:`, e);
+      await forwardUsageEvent({ event_name: `vas_instruction_${verb}_failed`, org: String(org).toUpperCase(), error: e.message });
+      return res.json({ success: false, error: e.message || 'VAS change failed', tokenInvalid: !!e.tokenInvalid });
     }
   }
 
