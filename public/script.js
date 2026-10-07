@@ -287,7 +287,10 @@ function vasDiffIconHtml(svc, st) {
 function vasExecutionLinkHtml(svc) {
   const base = lastResult && lastResult.vasExecutionUrl;
   if (!base || !svc.OlpnId) return '';
-  const differs = (svc.Steps || []).some((st) => vasStepDiffers(svc, st));
+  // The link opens the whole oLPN, so add diff=Y if ANY of its steps differs.
+  const differs = (lastResult.vasServices || [])
+    .filter((v) => v.OlpnId === svc.OlpnId)
+    .some((v) => (v.Steps || []).some((st) => vasStepDiffers(v, st)));
   const url = `${base}/?org=${encodeURIComponent(currentOrg)}&olpn=${encodeURIComponent(svc.OlpnId)}${differs ? '&diff=Y' : ''}`;
   return `<a class="vas-exec-link" href="${escapeHtml(url)}" target="_blank" rel="noopener" title="Open this oLPN in VAS Execution">VAS Execution <i class="fas fa-arrow-up-right-from-square"></i></a>`;
 }
