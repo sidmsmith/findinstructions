@@ -1112,7 +1112,7 @@ async function verifyVasStep(orgUpper, servicePk, stepPk, beforeInstructions, ch
   if (!step) return { error: 'Saved, but the step is no longer on the service.' };
   const after = asArray(step.AssignedServiceStepInstruction);
   if (stepFingerprint(after, changedPk) !== stepFingerprint(beforeInstructions, changedPk)) {
-    return { error: 'Saved, but other instructions on this step changed unexpectedly — refresh and check.', step, svc: r.svc };
+    return { error: 'Saved, but other instructions on this step changed unexpectedly — refresh and check.', step, svc: r.svc, after };
   }
   return { step, svc: r.svc, after };
 }
@@ -1140,12 +1140,13 @@ async function vasCreateInstruction({ org, servicePk, stepPk, instructionText },
   }, token);
   if (saved.error) return { success: false, error: `Create failed ${saved.error}` };
 
+  // The new row is expected to differ, so verifyVasStep's own comparison
+  // (which excludes nothing for a create) is ignored; compare without it.
   const v = await verifyVasStep(orgUpper, servicePk, stepPk, ctx.instructions, null, token);
-  if (v.error && !v.step) return { success: false, error: v.error };
-  const created = asArray(v.step.AssignedServiceStepInstruction).find((i) => i.AssignedServiceStepInstructionId === instructionId);
+  if (!v.after) return { success: false, error: v.error || 'Saved, but re-reading failed.' };
+  const created = v.after.find((i) => i.AssignedServiceStepInstructionId === instructionId);
   if (!created) return { success: false, error: 'MAWM accepted the create, but the new instruction is not on the step.' };
-  // The new row is expected to be the only difference.
-  if (stepFingerprint(v.after || [], created.PK) !== stepFingerprint(ctx.instructions, null)) {
+  if (stepFingerprint(v.after, created.PK) !== stepFingerprint(ctx.instructions, null)) {
     return { success: false, error: 'Created, but other instructions on this step changed unexpectedly — refresh and check.' };
   }
   return { success: true, pk: String(created.PK), instructionText: created.InstructionText, steps: shapeVasSteps(v.svc) };
