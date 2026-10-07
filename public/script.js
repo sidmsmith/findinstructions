@@ -371,6 +371,78 @@ function inlineTextEditor(host, initial, placeholder, positionCount) {
   });
 }
 
+// Inline "add VAS instruction" editor: Instruction (standard ones for this
+// step not already on it, or Custom text), Position 1..n+1 and text.
+// Resolves { instructionId|null, text, position } or null when cancelled.
+function vasAddEditor(host, n, choices) {
+  return new Promise((resolve) => {
+    const opts = ['<option value="">— Select an instruction —</option>']
+      .concat(choices.map((c) => `<option value="std:${escapeHtml(c.id).replace(/"/g, '&quot;')}">${escapeHtml(c.text || c.id)}</option>`))
+      .concat(['<option value="custom">Custom text…</option>']);
+    const positions = Array.from({ length: n + 1 }, (_, k) => {
+      const i = k + 1;
+      const note = n === 0 ? '' : i === 1 ? ' (first)' : i === n + 1 ? ' (last)' : '';
+      return `<option value="${i}"${i === n + 1 ? ' selected' : ''}>${i}${note}</option>`;
+    }).join('');
+    host.innerHTML = `
+      <div class="vas-add-editor">
+        <div class="d-flex gap-1 align-items-center mb-1">
+          <select class="form-select form-select-sm vas-choice">${opts.join('')}</select>
+          <select class="form-select form-select-sm vas-position" title="Position" style="width: auto;">${positions}</select>
+        </div>
+        <div class="d-flex gap-1 align-items-center instruction-editor">
+          <input type="text" class="form-control form-control-sm" maxlength="500" placeholder="Choose an instruction above, or Custom text" />
+          <button type="button" class="btn btn-success btn-sm save-btn" title="Save" disabled><i class="fas fa-check"></i></button>
+          <button type="button" class="btn btn-outline-secondary btn-sm cancel-btn" title="Cancel"><i class="fas fa-times"></i></button>
+        </div>
+      </div>`;
+    const choice = host.querySelector('.vas-choice');
+    const input = host.querySelector('input');
+    const saveBtn = host.querySelector('.save-btn');
+    const sync = () => { saveBtn.disabled = !choice.value || !input.value.trim(); };
+    choice.addEventListener('change', () => {
+      if (choice.value.startsWith('std:')) {
+        const c = choices.find((x) => x.id === choice.value.slice(4));
+        input.value = c ? c.text : '';
+      } else {
+        input.value = '';
+      }
+      sync();
+      if (choice.value) input.focus();
+    });
+    input.addEventListener('input', sync);
+    choice.focus();
+    const done = (v) => {
+      host.querySelectorAll('input, button, select').forEach((el) => { el.disabled = true; });
+      if (v !== null) saveBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+      resolve(v);
+    };
+    saveBtn.addEventListener('click', () => {
+      if (saveBtn.disabled) return;
+      done({
+        instructionId: choice.value.startsWith('std:') ? choice.value.slice(4) : null,
+        text: input.value.trim(),
+        position: Number(host.querySelector('.vas-position').value)
+      });
+    });
+    host.querySelector('.cancel-btn').addEventListener('click', () => done(null));
+    host.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && e.target === input) saveBtn.click();
+      else if (e.key === 'Escape') { e.stopPropagation(); done(null); }
+    });
+  });
+}
+
+// Standard instructions per VAS type + step, loaded on first use.
+const vasCatalogCache = new Map();
+async function loadVasStepCatalog(providedServiceId, stepId) {
+  const key = `${providedServiceId}|${stepId}`;
+  if (vasCatalogCache.has(key)) return vasCatalogCache.get(key);
+  const res = await apiCall('vas_step_catalog', { org: currentOrg, providedServiceId, stepId });
+  if (res.success) vasCatalogCache.set(key, res);
+  return res;
+}
+
 async function runVasWrite(action, payload, successMessage) {
   vasBusy = true;
   try {
@@ -446,10 +518,26 @@ async function onVasAction(btn) {
     const li = document.createElement('li');
     list.appendChild(li);
     btn.style.display = 'none';
-    const existing = list.querySelectorAll('li[data-ins]').length;
-    const entry = await inlineTextEditor(li, '', 'New VAS instruction text', existing);
+    const svc = (lastResult.vasServices || []).find((v) => String(v.PK) === servicePk);
+    const step = svc && svc.Steps.find((s) => String(s.PK) === stepPk);
+    li.innerHTML = '<span class="text-muted small"><i class="fas fa-spinner fa-spin"></i> Loading standard instructions…</span>';
+    vasBusy = true;
+    let catalog;
+    try {
+      catalog = await loadVasStepCatalog(svc.ProvidedServiceId, step.AssignedServiceStepId);
+    } finally {
+      vasBusy = false;
+    }
+    if (!catalog.success) {
+      if (catalog.tokenInvalid) { handleTokenInvalid(); return; }
+      showStatus(`${catalog.error || 'Could not load standard instructions'} — only custom text is available.`, 'warn');
+    }
+    // Offer only standard instructions not already on the step.
+    const onStep = new Set(step.Instructions.map((i) => i.AssignedServiceStepInstructionId));
+    const choices = (catalog.instructions || []).filter((c) => !onStep.has(c.id));
+    const entry = await vasAddEditor(li, step.Instructions.length, choices);
     if (entry === null) { if (lastResult) renderResults(lastResult); return; }
-    const res = await runVasWrite('vas_create_instruction', { servicePk, stepPk, instructionText: entry.text, position: entry.position },
+    const res = await runVasWrite('vas_create_instruction', { servicePk, stepPk, instructionText: entry.text, position: entry.position, instructionId: entry.instructionId },
       (r) => `VAS instruction added at position ${r.position || entry.position}: "${r.instructionText}"`);
     if (res && res.success && res.warning) showStatus(res.warning, 'warn');
   }

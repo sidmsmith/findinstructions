@@ -35,7 +35,7 @@ const USERNAME_BASE = process.env.MANHATTAN_USERNAME_BASE || 'sdtadmin@';
 const USAGE_INGEST_URL = (process.env.MANHATTAN_USAGE_INGEST_URL || '').trim();
 const USAGE_INGEST_SECRET = (process.env.MANHATTAN_USAGE_INGEST_SECRET || '').trim();
 const APP_NAME = 'findinstructions-app';
-const APP_VERSION = '1.13.1';
+const APP_VERSION = '1.14.0';
 
 async function forwardUsageEvent(payload) {
   if (!USAGE_INGEST_URL) {
@@ -74,6 +74,11 @@ const ASSIGNED_SERVICE_SEARCH_PATH = '/pickpack/api/fw-aux-svcs/assignedService/
 const ASSIGNED_SERVICE_SAVE_PATH = '/pickpack/api/fw-aux-svcs/assignedService/save';
 const ASSIGNED_SERVICE_GET_PATH = '/pickpack/api/fw-aux-svcs/assignedService';
 const VAS_EDITABLE_STATUS = '1000';
+// VAS master definitions: ProvidedService -> ProvidedServiceStep[] ->
+// StepInstruction[]. Endpoint CONFIRMED in Work/vasexecution; observed on
+// SS-DEMO that a master StepInstructionId is exactly the
+// AssignedServiceStepInstructionId used on assigned services (2026-10-07).
+const PROVIDED_SERVICE_SEARCH_PATH = '/aux-svcs/api/aux-svcs/providedService/search';
 // Same mapping as Work/vasexecution's ASSIGNED_SERVICE_STATUS.
 const ASSIGNED_SERVICE_STATUS = { 1000: 'Created', 2000: 'In Progress', 5000: 'Complete', 8000: 'Cancelled', 9000: 'Failed' };
 // Update-by-PK: PUT {base}/{PK} with the full entity (PK in the body too),
@@ -1063,6 +1068,25 @@ async function resequenceInstructions({ org, olpnId, pks }, token) {
 // VAS step instructions: create / update / delete (via assignedService/save)
 // ---------------------------------------------------------------------------
 
+// Standard (master) instructions for one step of a VAS type, in master order.
+async function getVasStepCatalog(orgUpper, providedServiceId, stepId, token) {
+  const resp = await mawmPost(PROVIDED_SERVICE_SEARCH_PATH, token, orgUpper, {
+    Query: `ProvidedServiceId='${escapeQuoted(providedServiceId)}'`,
+    Size: 5
+  });
+  if (!resp.httpOk || resp.parseError || resp.success === false) {
+    return { error: `Could not load the ${providedServiceId} definition ${describeMawmFailure(resp)}` };
+  }
+  const svc = dataRows(resp).find((r) => r.ProvidedServiceId === providedServiceId);
+  if (!svc) return { instructions: [] };
+  const step = asArray(svc.ProvidedServiceStep).find((st) => st.ProvidedServiceStepId === stepId);
+  const instructions = asArray(step && step.StepInstruction)
+    .filter((i) => i && i.StepInstructionId)
+    .map((i) => ({ id: String(i.StepInstructionId), text: i.InstructionText || '', sequence: Number(i.Sequence) || 0 }))
+    .sort((a, b) => a.sequence - b.sequence);
+  return { instructions };
+}
+
 async function getAssignedServiceByPk(orgUpper, servicePk, token) {
   const resp = await mawmRequest('GET', `${ASSIGNED_SERVICE_GET_PATH}/${encodeURIComponent(servicePk)}`, token, orgUpper);
   if (!resp.httpOk || resp.parseError || resp.success === false || !resp.data || Array.isArray(resp.data)) {
@@ -1145,10 +1169,26 @@ function newVasInstructionId(svc, step) {
   return `${prefix}_ins_${rand}`;
 }
 
-async function vasCreateInstruction({ org, servicePk, stepPk, instructionText, position }, token) {
+async function vasCreateInstruction({ org, servicePk, stepPk, instructionText, position, instructionId: standardId }, token) {
   const orgUpper = org.toUpperCase();
   const ctx = await loadEditableVasStep(orgUpper, servicePk, stepPk, null, token);
   if (ctx.error) return { success: false, error: ctx.error };
+
+  // Duplicates: a standard instruction (by its master id) or identical
+  // custom text can only be on a step once.
+  if (standardId) {
+    const catalog = await getVasStepCatalog(orgUpper, ctx.svc.ProvidedServiceId, ctx.step.AssignedServiceStepId, token);
+    if (catalog.error) return { success: false, error: catalog.error };
+    if (!catalog.instructions.some((i) => i.id === standardId)) {
+      return { success: false, error: `"${standardId}" is not a standard instruction of ${ctx.svc.ProvidedServiceId} / ${ctx.step.StepDescription}.` };
+    }
+    if (ctx.instructions.some((i) => i.AssignedServiceStepInstructionId === standardId)) {
+      return { success: false, error: `Step "${ctx.step.StepDescription}" already has that standard instruction.` };
+    }
+  }
+  if (ctx.instructions.some((i) => String(i.InstructionText || '').trim() === instructionText)) {
+    return { success: false, error: `Step "${ctx.step.StepDescription}" already has an instruction with that exact text.` };
+  }
 
   // Position is 1..n+1 within the step (default: last). Like Pick/Pack
   // create, the new row is appended first and the step is then renumbered
@@ -1159,7 +1199,7 @@ async function vasCreateInstruction({ org, servicePk, stepPk, instructionText, p
     return { success: false, error: `Position must be between 1 and ${n + 1} — step "${ctx.step.StepDescription}" has ${n} instruction(s).` };
   }
   const sequence = ctx.instructions.reduce((m, i) => Math.max(m, Number(i.Sequence) || 0), 0) + 1;
-  const instructionId = newVasInstructionId(ctx.svc, ctx.step);
+  const instructionId = standardId || newVasInstructionId(ctx.svc, ctx.step);
   const saved = await saveVasStepInstruction(orgUpper, servicePk, stepPk, {
     AssignedServiceStepInstructionId: instructionId,
     InstructionText: instructionText,
@@ -1454,6 +1494,21 @@ async function handler(req, res) {
     }
   }
 
+  if (action === 'vas_step_catalog') {
+    const org = req.body.org;
+    const providedServiceId = req.body.providedServiceId != null ? String(req.body.providedServiceId) : '';
+    const stepId = req.body.stepId != null ? String(req.body.stepId) : '';
+    if (!org || !String(org).trim()) return res.status(400).json({ success: false, error: 'ORG required' });
+    if (!providedServiceId || !stepId) return res.status(400).json({ success: false, error: 'providedServiceId and stepId are required' });
+    try {
+      const r = await getVasStepCatalog(String(org).toUpperCase(), providedServiceId, stepId, token);
+      return res.json(r.error ? { success: false, error: r.error } : { success: true, instructions: r.instructions });
+    } catch (e) {
+      console.error('[vas_step_catalog] error:', e);
+      return res.json({ success: false, error: e.message || 'Lookup failed', tokenInvalid: !!e.tokenInvalid });
+    }
+  }
+
   if (action === 'vas_resequence_instructions') {
     const org = req.body.org;
     const servicePk = req.body.servicePk != null ? String(req.body.servicePk).trim() : '';
@@ -1489,6 +1544,7 @@ async function handler(req, res) {
     const instructionPk = req.body.instructionPk != null ? String(req.body.instructionPk).trim() : '';
     const instructionText = req.body.instructionText != null ? String(req.body.instructionText).trim() : '';
     const position = req.body.position != null && req.body.position !== '' ? Number(req.body.position) : null;
+    const standardId = req.body.instructionId != null && req.body.instructionId !== '' ? String(req.body.instructionId) : null;
     const isNumeric = (v) => /^-?\d+$/.test(v);
 
     if (!org || !String(org).trim()) return res.status(400).json({ success: false, error: 'ORG required' });
@@ -1504,7 +1560,7 @@ async function handler(req, res) {
 
     const verb = action.replace('vas_', '').replace('_instruction', ''); // create | update | delete
     try {
-      const args = { org, servicePk, stepPk, instructionPk, instructionText, position };
+      const args = { org, servicePk, stepPk, instructionPk, instructionText, position, instructionId: standardId };
       const result = verb === 'create'
         ? await vasCreateInstruction(args, token)
         : verb === 'update'
