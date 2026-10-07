@@ -35,7 +35,7 @@ const USERNAME_BASE = process.env.MANHATTAN_USERNAME_BASE || 'sdtadmin@';
 const USAGE_INGEST_URL = (process.env.MANHATTAN_USAGE_INGEST_URL || '').trim();
 const USAGE_INGEST_SECRET = (process.env.MANHATTAN_USAGE_INGEST_SECRET || '').trim();
 const APP_NAME = 'findinstructions-app';
-const APP_VERSION = '1.14.0';
+const APP_VERSION = '1.15.0';
 
 async function forwardUsageEvent(payload) {
   if (!USAGE_INGEST_URL) {

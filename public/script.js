@@ -240,7 +240,9 @@ function targetLabel(row) {
 
 function typeBadge(type) {
   const cls = type === 'Pick' ? 'type-pick' : type === 'Pack' ? 'type-pack' : 'type-vas';
-  const icon = type === 'Pick' ? 'fa-hand-holding' : type === 'Pack' ? 'fa-box' : 'fa-tools';
+  // fa-hand (open palm) is centered like fa-box / fa-tools; fa-hand-holding's
+  // artwork sits at the bottom of its box and looked low next to them.
+  const icon = type === 'Pick' ? 'fa-hand' : type === 'Pack' ? 'fa-box' : 'fa-tools';
   return `<span class="type-badge ${cls}"><i class="fas ${icon}"></i> ${escapeHtml(type)}</span>`;
 }
 
@@ -1025,5 +1027,27 @@ valueInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') runSearch(valueInput.value.trim());
 });
 searchBtn.addEventListener('click', () => runSearch(valueInput.value.trim()));
+
+// Simple View: hides everything but Seq / Type / Instruction (and plain VAS
+// step lists). Pure CSS on #results, so toggling never re-fetches. Default
+// off; remembered per browser in localStorage (a convenience only — any
+// storage error just means the default).
+const SIMPLE_VIEW_KEY = 'findinstructions.simpleView';
+const simpleViewBox = document.getElementById('simpleView');
+function applySimpleView(on) {
+  resultsEl.classList.toggle('simple-view', on);
+}
+try {
+  simpleViewBox.checked = localStorage.getItem(SIMPLE_VIEW_KEY) === '1';
+} catch (e) {
+  simpleViewBox.checked = false;
+}
+applySimpleView(simpleViewBox.checked);
+simpleViewBox.addEventListener('change', () => {
+  applySimpleView(simpleViewBox.checked);
+  try {
+    localStorage.setItem(SIMPLE_VIEW_KEY, simpleViewBox.checked ? '1' : '0');
+  } catch (e) { /* storage unavailable: setting just isn't remembered */ }
+});
 
 init();

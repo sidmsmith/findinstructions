@@ -123,6 +123,20 @@ never resolved) are surfaced in the UI rather than silently dropped.
   instructions correctly joined back to order line, item, oLPN, oLPN
   detail, and task detail.
 
+## Simple View
+
+A **Simple View** checkbox at the right end of the "Add instruction" row
+strips the results down for quick reading: the instruction table shows
+only **Seq, Type and Instruction** (group rows keep the oLPN / target
+label), and each VAS card shows only the service, its target, and each
+step's numbered instructions. Hidden: counts, Add buttons, edit / delete /
+reorder controls, type badges, statuses, quantities, the unmatched panel
+and diagnostics. Uncheck it to edit.
+
+It's purely a CSS class (`simple-view`) on `#results`, so toggling never
+re-fetches. Defaults to off and is remembered per browser in
+`localStorage` (`findinstructions.simpleView`).
+
 ## Assigned instructions vs. VAS
 
 Two different MAWM record types hang off the **same requestor IDs** (the
