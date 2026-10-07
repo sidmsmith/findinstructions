@@ -83,9 +83,18 @@ Since these tokens expire every few hours, drop a fresh one into `.token`
    Task are shown only when every task detail on that oLPN has the same
    one.
 5. Rows are sorted per oLPN: header first, then details by number; within
-   a target Pick before Pack; then `Sequence`. So each **sequence group** —
+   a target Pick before Pack; then `Sequence`. Each **sequence group** —
    same oLPN, same target (header or one detail), same `InstructionType` —
-   sits together, separated from the next group by a heavier line.
+   sits together under a full-width label row (colored Pick / Pack badge,
+   oLPN, target, count).
+6. **VAS** (read-only): `POST /pickpack/api/fw-aux-svcs/assignedService/search`
+   with `ServiceRequestorId IN (...)` over **every** requestor ID on the
+   active oLPNs (from `OlpnAndDetailsServiceRequestorIds`, now requested in
+   step 2's template). Each assigned service is shown below the table as a
+   card — service, status, target, order line — with its
+   `AssignedServiceStep[]` and each step's
+   `AssignedServiceStepInstruction[]` text. See "Assigned instructions vs.
+   VAS" below.
 
 Unmatched records (an oLPN that couldn't be found, an oLPN detail with a
 requestor ID but no runtime instruction row, a task detail whose oLPN
@@ -112,6 +121,26 @@ never resolved) are surfaced in the UI rather than silently dropped.
   `6000012` (2026-08-17): returned real `Repack`/`Apply Labels` Pick
   instructions correctly joined back to order line, item, oLPN, oLPN
   detail, and task detail.
+
+## Assigned instructions vs. VAS
+
+Two different MAWM record types hang off the **same requestor IDs** (the
+oLPN header and each oLPN detail):
+
+| | Assigned instructions (Pick/Pack table) | VAS services (cards below) |
+|---|---|---|
+| Search | `fw-aux-svcs/assignedInstruction/search` | `fw-aux-svcs/assignedService/search` |
+| Filter | `InstructionRequestorId in (...)` | `ServiceRequestorId IN (...)` |
+| Shape | one flat row per instruction | service → `AssignedServiceStep[]` → `AssignedServiceStepInstruction[]` |
+| Instruction fields | `InstructionId`, `InstructionText`, `InstructionType`, `Sequence` | `AssignedServiceStepInstructionId`, `InstructionText`, `Sequence` |
+| Master data | `aux-svcs/instruction` | `aux-svcs/providedService` (VAS type → steps → `StepInstruction`) |
+| In this app | search, create, edit, reorder, delete | search only |
+
+The VAS endpoint and filter come from `Work/vasexecution`
+(`fetch_assigned_service_rows`). Both record types on one requestor were
+observed live on SS-DEMO oLPN `0000099999100015592` detail 1 (2026-10-06),
+and the VAS rows there sit on the same header/detail ID positions as the
+assigned instructions.
 
 ## Usage tracking
 

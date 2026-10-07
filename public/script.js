@@ -137,7 +137,8 @@ function renderResults(res) {
     `<span class="badge bg-secondary">oLPNs checked: ${c.olpnsLooked ?? 0}</span>`,
     `<span class="badge bg-secondary">Requestor IDs: ${c.requestorIds ?? 0}</span>`,
     (c.olpnsExcludedCancelled ? `<span class="badge bg-warning text-dark">oLPNs excluded (Cancelled): ${c.olpnsExcludedCancelled}</span>` : ''),
-    `<span class="badge bg-primary">Instructions found: ${c.instructions ?? 0}</span>`
+    `<span class="badge bg-primary">Instructions found: ${c.instructions ?? 0}</span>`,
+    (c.vasServices ? `<span class="badge bg-success">VAS services: ${c.vasServices}</span>` : '')
   ].join('');
 
   if (!res.instructions || res.instructions.length === 0) {
@@ -154,10 +155,10 @@ function renderResults(res) {
 
     let prevKey = null;
     for (const row of res.instructions) {
-      const tr = document.createElement('tr');
       const key = groupKey(row);
-      if (prevKey !== null && key !== prevKey) tr.classList.add('group-start');
+      if (key !== prevKey) resultsBody.appendChild(groupLabelRow(row, groups.get(key).length));
       prevKey = key;
+      const tr = document.createElement('tr');
       // Header-level instructions apply to the whole oLPN, not one line.
       const headerLabel = '<span class="header-label">Header</span>';
       tr.innerHTML = [
@@ -208,6 +209,7 @@ function renderResults(res) {
   }
 
   rawOutput.textContent = JSON.stringify(res.raw || {}, null, 2);
+  renderVas(res.vasServices || []);
   renderAddBar(res.activeOlpns || []);
   resultsEl.style.display = 'block';
 }
@@ -228,6 +230,68 @@ function compareInstructionRows(a, b) {
     return ta !== tb ? ta - tb : String(a.InstructionType).localeCompare(String(b.InstructionType));
   }
   return (Number(a.Sequence) || 0) - (Number(b.Sequence) || 0);
+}
+
+// Full-width label above each group: oLPN · target · type (count).
+function targetLabel(row) {
+  if (row.IsHeader) return 'oLPN header';
+  return `Detail ${escapeHtml(row.OlpnDetailId)}${row.ItemId ? ` – Item ${escapeHtml(row.ItemId)}` : ''}`;
+}
+
+function typeBadge(type) {
+  const cls = type === 'Pick' ? 'type-pick' : type === 'Pack' ? 'type-pack' : 'type-vas';
+  const icon = type === 'Pick' ? 'fa-hand-holding' : type === 'Pack' ? 'fa-box' : 'fa-tools';
+  return `<span class="type-badge ${cls}"><i class="fas ${icon}"></i> ${escapeHtml(type)}</span>`;
+}
+
+function groupLabelRow(row, count) {
+  const tr = document.createElement('tr');
+  tr.className = 'group-label';
+  tr.innerHTML = `<td colspan="15">${typeBadge(row.InstructionType)}` +
+    `<span class="group-target">oLPN ${escapeHtml(row.OlpnId)} · ${targetLabel(row)}</span>` +
+    `<span class="group-count">${count} instruction${count === 1 ? '' : 's'}</span></td>`;
+  return tr;
+}
+
+// VAS services on the same oLPNs — read-only, shown below the Pick/Pack
+// table, one card per service with its steps and step instructions.
+function renderVas(services) {
+  const section = document.getElementById('vasSection');
+  const list = document.getElementById('vasList');
+  if (!services || services.length === 0) {
+    section.style.display = 'none';
+    list.innerHTML = '';
+    return;
+  }
+  document.getElementById('vasCount').textContent = services.length;
+  list.innerHTML = services.map((svc) => {
+    const where = [
+      `oLPN ${escapeHtml(svc.OlpnId)}`,
+      targetLabel(svc),
+      svc.OrderId ? `Order ${escapeHtml(svc.OrderId)}${svc.OrderLineId ? ` / line ${escapeHtml(svc.OrderLineId)}` : ''}` : ''
+    ].filter(Boolean).join(' · ');
+    const steps = (svc.Steps || []).map((st) => `
+      <li class="vas-step">
+        <div><strong>${escapeHtml(st.StepDescription || 'Step')}</strong>
+          <span class="vas-status">${escapeHtml(st.Status || '')}</span>
+          ${st.RequestedQuantity != null ? `<span class="text-muted small">qty ${escapeHtml(st.CompletedQuantity ?? 0)}/${escapeHtml(st.RequestedQuantity)}</span>` : ''}
+        </div>
+        ${(st.Instructions || []).length
+          ? `<ol class="vas-instructions">${st.Instructions.map((i) => `<li>${escapeHtml(i.InstructionText)}</li>`).join('')}</ol>`
+          : '<div class="text-muted small">No instructions</div>'}
+      </li>`).join('');
+    return `
+      <div class="vas-card">
+        <div class="vas-card-head">
+          ${typeBadge('VAS')}
+          <span class="vas-name">${escapeHtml(svc.Description || svc.ProvidedServiceId)}</span>
+          <span class="vas-status">${escapeHtml(svc.Status || '')}</span>
+          <span class="group-target">${where}</span>
+        </div>
+        <ol class="vas-steps">${steps}</ol>
+      </div>`;
+  }).join('');
+  section.style.display = 'block';
 }
 
 // Sequence only matters within one oLPN + target (header or one detail) +

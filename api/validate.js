@@ -35,7 +35,7 @@ const USERNAME_BASE = process.env.MANHATTAN_USERNAME_BASE || 'sdtadmin@';
 const USAGE_INGEST_URL = (process.env.MANHATTAN_USAGE_INGEST_URL || '').trim();
 const USAGE_INGEST_SECRET = (process.env.MANHATTAN_USAGE_INGEST_SECRET || '').trim();
 const APP_NAME = 'findinstructions-app';
-const APP_VERSION = '1.9.0';
+const APP_VERSION = '1.10.0';
 
 async function forwardUsageEvent(payload) {
   if (!USAGE_INGEST_URL) {
@@ -58,6 +58,14 @@ async function forwardUsageEvent(payload) {
 const TASK_SEARCH_PATH = '/task/api/task/task/search';
 const OLPN_SEARCH_PATH = '/pickpack/api/pickpack/olpn/search';
 const ASSIGNED_INSTRUCTION_SEARCH_PATH = '/pickpack/api/fw-aux-svcs/assignedInstruction/search';
+// VAS: assigned services (with steps and step instructions) hang off the
+// SAME requestor IDs as assigned instructions. Endpoint and
+// `ServiceRequestorId IN (...)` filter CONFIRMED in Work/vasexecution
+// (fetch_assigned_service_rows); both kinds of record on one requestor
+// observed live on SS-DEMO oLPN 0000099999100015592 detail 1 (2026-10-06).
+const ASSIGNED_SERVICE_SEARCH_PATH = '/pickpack/api/fw-aux-svcs/assignedService/search';
+// Same mapping as Work/vasexecution's ASSIGNED_SERVICE_STATUS.
+const ASSIGNED_SERVICE_STATUS = { 1000: 'Created', 2000: 'In Progress', 5000: 'Complete', 8000: 'Cancelled', 9000: 'Failed' };
 // Update-by-PK: PUT {base}/{PK} with the full entity (PK in the body too),
 // only InstructionText changed. Taken from a Glean conversation, confirmed
 // by the user in Postman and then live through this app against SS-DEMO
@@ -288,6 +296,7 @@ async function findInstructions({ org, mode, value }, token) {
   const olpnsNotFound = [];
   const olpnsExcludedCancelled = []; // { olpnId, status } — found, but Status='9000' (Cancelled)
   const olpnStatusById = new Map();
+  const allRequestors = new Map(); // requestorId -> { type, olpnId, olpnDetailId, itemId }, every target on every active oLPN
   const activeOlpns = []; // { olpnId, status } — found and not Cancelled
   const olpnRaw = {};
 
@@ -298,6 +307,7 @@ async function findInstructions({ org, mode, value }, token) {
       Template: {
         OlpnId: null,
         Status: null,
+        OlpnAndDetailsServiceRequestorIds: null,
         AssignedInstruction: null,
         OlpnDetail: { OlpnDetailId: null, ItemId: null, AssignedInstruction: null }
       },
@@ -327,6 +337,16 @@ async function findInstructions({ org, mode, value }, token) {
     }
 
     for (const row of activeRows) {
+      // Every requestor on the oLPN (header first, then one per detail in
+      // OlpnDetail order — see readOlpnWithRequestors) — used for VAS.
+      const ids = String(row.OlpnAndDetailsServiceRequestorIds || '').split(',').map((x) => x.trim()).filter(Boolean);
+      const details = asArray(row.OlpnDetail);
+      if (ids.length === details.length + 1) {
+        allRequestors.set(ids[0], { type: 'Olpn', olpnId, olpnDetailId: null, itemId: null });
+        details.forEach((d, i) => {
+          allRequestors.set(ids[i + 1], { type: 'OlpnDetail', olpnId, olpnDetailId: d.OlpnDetailId, itemId: d.ItemId });
+        });
+      }
       for (const inst of asArray(row.AssignedInstruction)) {
         if (!inst || !inst.InstructionRequestorId) continue;
         requestorMap.set(String(inst.InstructionRequestorId), {
@@ -463,6 +483,64 @@ async function findInstructions({ org, mode, value }, token) {
 
   flattened.sort(compareInstructionRows);
 
+  // 5b. VAS: assigned services on the same requestors, with their steps and
+  //     step instructions. Read-only.
+  const vasServices = [];
+  if (allRequestors.size > 0) {
+    const ids = [...allRequestors.keys()].filter((id) => /^-?\d+$/.test(id));
+    const vasQuery = `ServiceRequestorId IN (${ids.join(',')})`;
+    const vasResp = await mawmPost(ASSIGNED_SERVICE_SEARCH_PATH, token, orgUpper, { Query: vasQuery, Size: 500 });
+    logCall('assignedServiceSearch', ASSIGNED_SERVICE_SEARCH_PATH, vasQuery, vasResp);
+    for (const svc of dataRows(vasResp)) {
+      const ctx = allRequestors.get(String(svc.ServiceRequestorId)) || {};
+      const isHeader = ctx.type === 'Olpn';
+      const olpnTaskDetails = taskDetails.filter((td) => td.OlpnId === ctx.olpnId);
+      const td = isHeader ? null : olpnTaskDetails.find((t) => t.OlpnDetailId === ctx.olpnDetailId);
+      const statusId = svc.StatusId != null ? String(svc.StatusId) : null;
+      vasServices.push({
+        OlpnId: ctx.olpnId || null,
+        IsHeader: isHeader,
+        OlpnDetailId: ctx.olpnDetailId || null,
+        ItemId: isHeader ? null : (td && td.ItemId) || ctx.itemId || null,
+        OrderId: isHeader ? sharedValue(olpnTaskDetails, 'OrderId') : (td && td.OrderId) || null,
+        OrderLineId: (td && td.OrderLineId) || null,
+        ServiceRequestorTypeId: svc.ServiceRequestorTypeId,
+        ServiceRequestorId: svc.ServiceRequestorId != null ? String(svc.ServiceRequestorId) : null,
+        ProvidedServiceId: svc.ProvidedServiceId,
+        Description: svc.Description || svc.ProvidedServiceId,
+        Sequence: svc.Sequence,
+        StatusId: statusId,
+        Status: ASSIGNED_SERVICE_STATUS[statusId] || statusId,
+        PK: svc.PK,
+        Steps: asArray(svc.AssignedServiceStep)
+          .map((st) => {
+            const stepStatusId = st.StatusId != null ? String(st.StatusId) : statusId;
+            return {
+              AssignedServiceStepId: st.AssignedServiceStepId,
+              StepDescription: st.StepDescription,
+              Sequence: st.Sequence,
+              StatusId: stepStatusId,
+              Status: ASSIGNED_SERVICE_STATUS[stepStatusId] || stepStatusId,
+              RequestedQuantity: st.RequestedQuantity,
+              CompletedQuantity: st.CompletedQuantity,
+              PK: st.PK,
+              Instructions: asArray(st.AssignedServiceStepInstruction)
+                .filter((i) => i && i.InstructionText)
+                .map((i) => ({ Sequence: i.Sequence, InstructionText: i.InstructionText, PK: i.PK }))
+                .sort((a, b) => (Number(a.Sequence) || 0) - (Number(b.Sequence) || 0))
+            };
+          })
+          .sort((a, b) => (Number(a.Sequence) || 0) - (Number(b.Sequence) || 0))
+      });
+    }
+    vasServices.sort((a, b) =>
+      compareInstructionRows(
+        { ...a, InstructionType: 'VAS' },
+        { ...b, InstructionType: 'VAS' }
+      ) || String(a.ProvidedServiceId).localeCompare(String(b.ProvidedServiceId))
+    );
+  }
+
   // 6. Unmatched diagnostics.
   const matchedRequestorIds = new Set(instructionRows.map((r) => String(r.InstructionRequestorId)));
   const olpnDetailsNoInstruction = [];
@@ -485,6 +563,7 @@ async function findInstructions({ org, mode, value }, token) {
     mode,
     value,
     instructions: flattened,
+    vasServices,
     activeOlpns,
     counts: {
       taskDetails: taskDetails.length,
@@ -492,7 +571,8 @@ async function findInstructions({ org, mode, value }, token) {
       olpnsNotFound: olpnsNotFound.length,
       olpnsExcludedCancelled: olpnsExcludedCancelled.length,
       requestorIds: requestorMap.size,
-      instructions: flattened.length
+      instructions: flattened.length,
+      vasServices: vasServices.length
     },
     unmatched: {
       olpnsNotFound,
