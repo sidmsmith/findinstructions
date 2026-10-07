@@ -329,11 +329,22 @@ function vasInstructionText(servicePk, stepPk, pk) {
 }
 
 // Inline text editor inside `host`; resolves with the trimmed text, or
-// null when cancelled.
-function inlineTextEditor(host, initial, placeholder) {
+// null when cancelled. With `positionCount` (n existing instructions) it
+// also shows a Position dropdown 1..n+1 (default last) and resolves with
+// { text, position } instead.
+function inlineTextEditor(host, initial, placeholder, positionCount) {
   return new Promise((resolve) => {
+    const n = positionCount;
+    const positions = n == null ? '' :
+      `<select class="form-select form-select-sm vas-position" title="Position" style="width: auto;">` +
+      Array.from({ length: n + 1 }, (_, k) => {
+        const i = k + 1;
+        const note = n === 0 ? '' : i === 1 ? ' (first)' : i === n + 1 ? ' (last)' : '';
+        return `<option value="${i}"${i === n + 1 ? ' selected' : ''}>${i}${note}</option>`;
+      }).join('') + `</select>`;
     host.innerHTML = `
       <div class="d-flex gap-1 align-items-center instruction-editor">
+        ${positions}
         <input type="text" class="form-control form-control-sm" maxlength="500" placeholder="${placeholder || ''}" />
         <button type="button" class="btn btn-success btn-sm save-btn" title="Save"><i class="fas fa-check"></i></button>
         <button type="button" class="btn btn-outline-secondary btn-sm cancel-btn" title="Cancel"><i class="fas fa-times"></i></button>
@@ -343,14 +354,14 @@ function inlineTextEditor(host, initial, placeholder) {
     input.focus();
     input.select();
     const done = (v) => {
-      host.querySelectorAll('input, button').forEach((el) => { el.disabled = true; });
+      host.querySelectorAll('input, button, select').forEach((el) => { el.disabled = true; });
       if (v !== null) host.querySelector('.save-btn').innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
       resolve(v);
     };
     host.querySelector('.save-btn').addEventListener('click', () => {
       const v = input.value.trim();
       if (!v) { showStatus('Instruction text cannot be empty.', 'error'); return; }
-      done(v);
+      done(n == null ? v : { text: v, position: Number(host.querySelector('.vas-position').value) });
     });
     host.querySelector('.cancel-btn').addEventListener('click', () => done(null));
     input.addEventListener('keydown', (e) => {
@@ -423,7 +434,7 @@ async function onVasAction(btn) {
         const res = await apiCall('vas_delete_instruction', { org: currentOrg, servicePk, stepPk, instructionPk: pk });
         if (res.success) {
           applyVasSteps(servicePk, res.steps);
-          res.message = `VAS instruction deleted: "${res.deletedText}"`;
+          res.message = res.warning || `VAS instruction deleted: "${res.deletedText}"`;
         }
         return res;
       }
@@ -435,10 +446,12 @@ async function onVasAction(btn) {
     const li = document.createElement('li');
     list.appendChild(li);
     btn.style.display = 'none';
-    const text = await inlineTextEditor(li, '', 'New VAS instruction text');
-    if (text === null) { if (lastResult) renderResults(lastResult); return; }
-    await runVasWrite('vas_create_instruction', { servicePk, stepPk, instructionText: text },
-      (res) => `VAS instruction added: "${res.instructionText}"`);
+    const existing = list.querySelectorAll('li[data-ins]').length;
+    const entry = await inlineTextEditor(li, '', 'New VAS instruction text', existing);
+    if (entry === null) { if (lastResult) renderResults(lastResult); return; }
+    const res = await runVasWrite('vas_create_instruction', { servicePk, stepPk, instructionText: entry.text, position: entry.position },
+      (r) => `VAS instruction added at position ${r.position || entry.position}: "${r.instructionText}"`);
+    if (res && res.success && res.warning) showStatus(res.warning, 'warn');
   }
 }
 
@@ -727,9 +740,12 @@ function renderInstructionCell(cell, text) {
           // Drop every row carrying this PK and re-render (keeps counts and
           // reorder arrows correct).
           lastResult.instructions = lastResult.instructions.filter((r) => String(r.PK) !== cell.dataset.pk);
+          // The backend renumbered the rest of the group to close the gap.
+          const seqs = new Map((res.sequences || []).map((x) => [String(x.pk), x.sequence]));
+          for (const r of lastResult.instructions) if (seqs.has(String(r.PK))) r.Sequence = seqs.get(String(r.PK));
           if (lastResult.counts) lastResult.counts.instructions = lastResult.instructions.length;
           renderResults(lastResult);
-          res.message = `Instruction deleted: "${res.deletedText}"`;
+          res.message = res.renumberWarning || `Instruction deleted: "${res.deletedText}"`;
         }
         return res;
       }

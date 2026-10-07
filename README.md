@@ -159,7 +159,7 @@ steps and instructions are left unchanged.
 
 | Action | Instruction object sent |
 |---|---|
-| `vas_create_instruction` | `{AssignedServiceStepInstructionId, InstructionText, Sequence}` — no PK (MAWM generates it); id generated as `{ProvidedServiceId}_{StepId}_ins_{random}` (≤ 50 chars, same style as existing ids); appended at the end of the step |
+| `vas_create_instruction` | `{AssignedServiceStepInstructionId, InstructionText, Sequence}` — no PK (MAWM generates it); id generated as `{ProvidedServiceId}_{StepId}_ins_{random}` (≤ 50 chars, same style as existing ids). The inline add editor has a **Position** dropdown 1…n+1 (default last): the row is appended, then the step is renumbered with one resequence save (also closing any gaps); if that second save fails the instruction stays at the end and a warning is shown |
 | `vas_update_instruction` | `{PK, InstructionText}` |
 | `vas_delete_instruction` | `{ApplyAction: "DELETE", PK}` |
 | `vas_resequence_instructions` | one `{PK, Sequence}` per instruction whose number changes |
@@ -334,6 +334,10 @@ Cancel, Esc, or clicking outside closes it.
 
 - `DELETE .../assignedInstruction/{PK}` (no body). A 2xx with an empty body
   counts as success unless MAWM returns `success: false`.
+- After the delete, the rest of that sequence group (same requestor +
+  type) is renumbered 1…n so no gap is left (deleting 2 of 1, 2, 3 leaves
+  1, 2), with the same per-row PUT as reorder. VAS deletes do the same with
+  one resequence save.
 - The record is re-read afterwards; success is only reported if search no
   longer returns it. The row(s) with that `PK` are then removed from the
   table and the "Instructions found" count is updated.

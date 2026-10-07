@@ -35,7 +35,7 @@ const USERNAME_BASE = process.env.MANHATTAN_USERNAME_BASE || 'sdtadmin@';
 const USAGE_INGEST_URL = (process.env.MANHATTAN_USAGE_INGEST_URL || '').trim();
 const USAGE_INGEST_SECRET = (process.env.MANHATTAN_USAGE_INGEST_SECRET || '').trim();
 const APP_NAME = 'findinstructions-app';
-const APP_VERSION = '1.12.0';
+const APP_VERSION = '1.13.1';
 
 async function forwardUsageEvent(payload) {
   if (!USAGE_INGEST_URL) {
@@ -749,7 +749,27 @@ async function deleteInstruction({ org, pk }, token) {
     return { success: false, error: 'MAWM accepted the delete, but the instruction is still returned by search.' };
   }
 
-  return { success: true, pk: String(pk), deletedText: current.InstructionText };
+  // 4. Close the gap in its sequence group (same requestor + type), so
+  //    deleting 2 of 1,2,3 leaves 1,2 — matching how create renumbers.
+  let sequences = [];
+  let renumberWarning = null;
+  const groupResp = await mawmPost(ASSIGNED_INSTRUCTION_SEARCH_PATH, token, orgUpper, {
+    Query: `InstructionRequestorTypeId='${escapeQuoted(current.InstructionRequestorTypeId)}' ` +
+      `and InstructionRequestorId='${escapeQuoted(current.InstructionRequestorId)}'`,
+    Size: 200
+  });
+  if (groupResp.httpOk && groupResp.success !== false) {
+    const group = dataRows(groupResp)
+      .filter((r) => r.InstructionType === current.InstructionType && String(r.PK) !== String(pk))
+      .sort((a, b) => (Number(a.Sequence) || 0) - (Number(b.Sequence) || 0) || String(a.PK).localeCompare(String(b.PK)));
+    const renumbered = await renumberRows(orgUpper, group, token);
+    if (renumbered.error) renumberWarning = `Deleted, but renumbering the remaining instructions failed: ${renumbered.error}`;
+    else sequences = group.map((r, i) => ({ pk: String(r.PK), sequence: i + 1 }));
+  } else {
+    renumberWarning = 'Deleted, but the remaining instructions could not be re-read to renumber them.';
+  }
+
+  return { success: true, pk: String(pk), deletedText: current.InstructionText, sequences, renumberWarning };
 }
 
 // ---------------------------------------------------------------------------
@@ -1125,12 +1145,19 @@ function newVasInstructionId(svc, step) {
   return `${prefix}_ins_${rand}`;
 }
 
-async function vasCreateInstruction({ org, servicePk, stepPk, instructionText }, token) {
+async function vasCreateInstruction({ org, servicePk, stepPk, instructionText, position }, token) {
   const orgUpper = org.toUpperCase();
   const ctx = await loadEditableVasStep(orgUpper, servicePk, stepPk, null, token);
   if (ctx.error) return { success: false, error: ctx.error };
 
-  // Appended at the end of the step (VAS reorder isn't verified yet).
+  // Position is 1..n+1 within the step (default: last). Like Pick/Pack
+  // create, the new row is appended first and the step is then renumbered
+  // with the confirmed one-save resequence.
+  const n = ctx.instructions.length;
+  const pos = position == null ? n + 1 : Number(position);
+  if (!Number.isInteger(pos) || pos < 1 || pos > n + 1) {
+    return { success: false, error: `Position must be between 1 and ${n + 1} — step "${ctx.step.StepDescription}" has ${n} instruction(s).` };
+  }
   const sequence = ctx.instructions.reduce((m, i) => Math.max(m, Number(i.Sequence) || 0), 0) + 1;
   const instructionId = newVasInstructionId(ctx.svc, ctx.step);
   const saved = await saveVasStepInstruction(orgUpper, servicePk, stepPk, {
@@ -1149,7 +1176,28 @@ async function vasCreateInstruction({ org, servicePk, stepPk, instructionText },
   if (stepFingerprint(v.after, created.PK) !== stepFingerprint(ctx.instructions, null)) {
     return { success: false, error: 'Created, but other instructions on this step changed unexpectedly — refresh and check.' };
   }
-  return { success: true, pk: String(created.PK), instructionText: created.InstructionText, steps: shapeVasSteps(v.svc) };
+  // Slot it in at the chosen position and renumber 1..n+1 (also closes gaps).
+  const order = ctx.instructions
+    .map((i) => ({ pk: String(i.PK), seq: Number(i.Sequence) || 0 }))
+    .sort((a, b) => a.seq - b.seq || a.pk.localeCompare(b.pk))
+    .map((x) => x.pk);
+  order.splice(pos - 1, 0, String(created.PK));
+  const contiguous = v.after.every((i) => Number(i.Sequence) === order.indexOf(String(i.PK)) + 1);
+  if (!contiguous) {
+    const rs = await vasResequenceInstructions({ org, servicePk, stepPk, pks: order }, token);
+    if (!rs.success) {
+      return {
+        success: true,
+        pk: String(created.PK),
+        instructionText: created.InstructionText,
+        position: n + 1,
+        steps: shapeVasSteps(v.svc),
+        warning: `Added at the end, but moving it to position ${pos} failed: ${rs.error}`
+      };
+    }
+    if (rs.steps) return { success: true, pk: String(created.PK), instructionText: created.InstructionText, position: pos, steps: rs.steps };
+  }
+  return { success: true, pk: String(created.PK), instructionText: created.InstructionText, position: pos, steps: shapeVasSteps(v.svc) };
 }
 
 async function vasUpdateInstruction({ org, servicePk, stepPk, instructionPk, instructionText }, token) {
@@ -1187,6 +1235,20 @@ async function vasDeleteInstruction({ org, servicePk, stepPk, instructionPk }, t
   if (v.error) return { success: false, error: v.error };
   if (v.after.some((i) => String(i.PK) === String(instructionPk))) {
     return { success: false, error: 'MAWM accepted the delete, but the instruction is still on the step.' };
+  }
+  // Close the gap in the step's numbering (same as Pick/Pack delete).
+  const remaining = v.after
+    .map((i) => ({ pk: String(i.PK), seq: Number(i.Sequence) || 0 }))
+    .sort((a, b) => a.seq - b.seq || a.pk.localeCompare(b.pk));
+  if (remaining.length > 0 && remaining.some((x, i) => x.seq !== i + 1)) {
+    const rs = await vasResequenceInstructions({ org, servicePk, stepPk, pks: remaining.map((x) => x.pk) }, token);
+    if (rs.success && rs.steps) {
+      return { success: true, pk: String(instructionPk), deletedText: ctx.instruction.InstructionText, steps: rs.steps };
+    }
+    return {
+      success: true, pk: String(instructionPk), deletedText: ctx.instruction.InstructionText, steps: shapeVasSteps(v.svc),
+      warning: `Deleted, but renumbering the remaining instructions failed: ${rs.error}`
+    };
   }
   return { success: true, pk: String(instructionPk), deletedText: ctx.instruction.InstructionText, steps: shapeVasSteps(v.svc) };
 }
@@ -1426,6 +1488,7 @@ async function handler(req, res) {
     const stepPk = req.body.stepPk != null ? String(req.body.stepPk).trim() : '';
     const instructionPk = req.body.instructionPk != null ? String(req.body.instructionPk).trim() : '';
     const instructionText = req.body.instructionText != null ? String(req.body.instructionText).trim() : '';
+    const position = req.body.position != null && req.body.position !== '' ? Number(req.body.position) : null;
     const isNumeric = (v) => /^-?\d+$/.test(v);
 
     if (!org || !String(org).trim()) return res.status(400).json({ success: false, error: 'ORG required' });
@@ -1441,7 +1504,7 @@ async function handler(req, res) {
 
     const verb = action.replace('vas_', '').replace('_instruction', ''); // create | update | delete
     try {
-      const args = { org, servicePk, stepPk, instructionPk, instructionText };
+      const args = { org, servicePk, stepPk, instructionPk, instructionText, position };
       const result = verb === 'create'
         ? await vasCreateInstruction(args, token)
         : verb === 'update'
