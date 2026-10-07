@@ -41,7 +41,7 @@ const VAS_EXECUTION_URL = (() => {
   const v = (process.env.VAS_EXECUTION_URL || 'https://vasexecution.vercel.app').trim();
   return /^off$/i.test(v) || !/^https?:\/\//i.test(v) ? null : v.replace(/\/+$/, '');
 })();
-const APP_VERSION = '1.16.0';
+const APP_VERSION = '1.16.1';
 
 async function forwardUsageEvent(payload) {
   if (!USAGE_INGEST_URL) {

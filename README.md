@@ -140,7 +140,7 @@ never resolved) are surfaced in the UI rather than silently dropped.
   Execution (with `&diff=Y` when a step differs). Base URL from the
   `VAS_EXECUTION_URL` env var (default `https://vasexecution.vercel.app`;
   `off` hides the links).
-- Both are hidden in Simple View. Pick/Pack instructions get neither —
+- Both stay visible in Simple View. Pick/Pack instructions get neither —
   VAS Execution doesn't show them.
 
 ## Simple View
